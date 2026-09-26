@@ -22,7 +22,7 @@ extern crate alloc;
 #[cfg_attr(feature = "library", allow(unused_imports))]
 use soroban_sdk::{
     xdr::ToXdr, contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
-    BytesN, Env, Symbol, Vec,
+    BytesN, Env, Symbol, SymbolStr, TryFromVal, Vec,
 };
 
 pub mod types;
@@ -39,6 +39,19 @@ use parashield_common::{TTL_THRESHOLD, TTL_EXTEND_TO, ADMIN_TRANSFER_TIMELOCK};
 const MAX_ORACLES: u32 = 100;
 /// Maximum number of data points stored per (data_type, key).
 const MAX_DATA_POINTS: u32 = 100;
+
+/// Maximum length, in bytes, of the `key` a submission may carry (issue #565).
+///
+/// Soroban caps `Symbol` at 32 bytes, so this is the widest key the host can
+/// even hand the contract — the bound is enforced here rather than left
+/// implicit in a host rule, because a key is half of a persistent storage key
+/// (`DataPoints(data_type, key)`). An unbounded key space is a storage-bloat
+/// vector: every distinct key a registered oracle invents is a new persistent
+/// entry the protocol pays rent on, and the oracles that would have to be
+/// trusted to police it are exactly the ones feeding claims. The same check
+/// also rejects the empty key, which would otherwise collapse every reading
+/// for a data_type into one shared bucket that any oracle can overwrite.
+const MAX_KEY_LEN: usize = 32;
 
 /// Default outlier-rejection threshold, in basis points of the median
 /// absolute deviation (MAD): a submission is flagged once its distance from
@@ -1787,7 +1800,8 @@ impl OracleVerifier {
     /// values is returned.
     ///
     /// - `data_type`: category — "weather", "flight", "onchain", "disaster"
-    /// - `key`: specific measurement — "rainfall:kisumu:2026-06", "flight:KQ100:2026-06-15"
+    /// - `key`: specific measurement — "rainfall:kisumu:2026-06", "flight:KQ100:2026-06-15".
+    ///   Must be non-empty and at most [`MAX_KEY_LEN`] bytes (#565).
     /// - `value`: 7-decimal fixed point (same precision as Stellar assets)
     /// - `confidence`: 0-100 reliability score
     /// - `timestamp`: Unix timestamp of the real-world observation
@@ -1805,6 +1819,10 @@ impl OracleVerifier {
         if Self::encryption_required(&env, &data_type) {
             panic_with_error!(&env, Error::EncryptionRequiredForType);
         }
+        Self::validate_symbol_len(&env, &data_type);
+        // Bound the key before it is used to build a persistent storage entry
+        // (#565).
+        Self::validate_key_len(&env, &key);
         if confidence == 0 || confidence > 100 {
             panic_with_error!(&env, Error::InvalidConfidence);
         }
@@ -1975,9 +1993,9 @@ impl OracleVerifier {
             panic_with_error!(&env, Error::InvalidConfidence);
         }
 
-        // Validate Symbol lengths (#502).
+        // Validate Symbol lengths (#502, #565).
         Self::validate_symbol_len(&env, &data_type);
-        Self::validate_symbol_len(&env, &key);
+        Self::validate_key_len(&env, &key);
 
         let now = env.ledger().timestamp();
         if timestamp > now {
@@ -2504,7 +2522,8 @@ impl OracleVerifier {
     }
 
     /// Submit data for multiple keys in one call.
-    /// Each tuple: (key, value, confidence, timestamp).
+    /// Each tuple: (key, value, confidence, timestamp). Every key must satisfy
+    /// the same length rules as `submit_data` (#565).
     pub fn batch_submit_data(
         env: Env,
         oracle: Address,
@@ -2516,6 +2535,7 @@ impl OracleVerifier {
         if Self::encryption_required(&env, &data_type) {
             panic_with_error!(&env, Error::EncryptionRequiredForType);
         }
+        Self::validate_symbol_len(&env, &data_type);
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         let entry: OracleEntry = env
             .storage()
@@ -2534,6 +2554,7 @@ impl OracleVerifier {
 
         for i in 0..submissions.len() {
             let (key, value, confidence, timestamp) = submissions.get_unchecked(i);
+            Self::validate_key_len(&env, &key);
             if confidence == 0 || confidence > 100 {
                 panic_with_error!(&env, Error::InvalidConfidence);
             }
@@ -2605,7 +2626,8 @@ impl OracleVerifier {
     /// and latency of calling `submit_data` once per key.  All readings share
     /// the same `oracle` and `data_type`; each carries its own key, value,
     /// confidence, and timestamp.  Every reading is validated and persisted
-    /// atomically within the single transaction.
+    /// atomically within the single transaction, and every key must satisfy
+    /// the same length rules as `submit_data` (#565).
     pub fn submit_data_batch(
         env: Env,
         oracle: Address,
@@ -2617,6 +2639,7 @@ impl OracleVerifier {
         if Self::encryption_required(&env, &data_type) {
             panic_with_error!(&env, Error::EncryptionRequiredForType);
         }
+        Self::validate_symbol_len(&env, &data_type);
 
         let oracle_key = StorageKey::Oracle(data_type.clone(), oracle.clone());
         let entry: OracleEntry = env
@@ -2636,6 +2659,7 @@ impl OracleVerifier {
 
         for i in 0..submissions.len() {
             let sub = submissions.get_unchecked(i);
+            Self::validate_key_len(&env, &sub.key);
             if sub.confidence == 0 || sub.confidence > 100 {
                 panic_with_error!(&env, Error::InvalidConfidence);
             }
@@ -2907,6 +2931,24 @@ impl OracleVerifier {
         let xdr_len = ToXdr::to_xdr(symbol.clone(), env).len();
         // XDR: 4-byte type tag + 4-byte length + bytes padded to a multiple of 4.
         if xdr_len <= 8 || xdr_len > 8 + 32 {
+            panic_with_error!(env, Error::InvalidSymbolLength);
+        }
+    }
+
+    /// Reject a submission `key` that is empty or longer than [`MAX_KEY_LEN`]
+    /// (issue #565). Panics with `InvalidSymbolLength`.
+    ///
+    /// Applied by every entry point that writes a `(data_type, key)` storage
+    /// entry, so a key is bounded before it can be persisted rather than after.
+    fn validate_key_len(env: &Env, key: &Symbol) {
+        let key_str: Result<SymbolStr, _> = SymbolStr::try_from_val(env, &key.to_symbol_val());
+        let len = match key_str {
+            Ok(s) => s.len(),
+            // Not representable as a symbol string, so it cannot name a
+            // measurement anyone could read back.
+            Err(_) => panic_with_error!(env, Error::InvalidSymbolLength),
+        };
+        if len == 0 || len > MAX_KEY_LEN {
             panic_with_error!(env, Error::InvalidSymbolLength);
         }
     }
