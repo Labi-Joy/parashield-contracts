@@ -362,15 +362,15 @@ impl ClaimsProcessor {
         // Verify policy is Active via Policy Engine
         let policy_engine: Address = env.storage().instance()
             .get(&StorageKey::PolicyEngine)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        let policy = PolicyEngineClient::new(&env, &policy_engine)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        let policy = PolicyEngineClient::new(env, &policy_engine)
             .get_policy(&policy_id);
 
         if policy.policyholder != *claimant {
-            panic_with_error!(&env, Error::Unauthorized);
+            panic_with_error!(env, Error::Unauthorized);
         }
         if policy.status != parashield_policy_engine::PolicyStatus::Active {
-            panic_with_error!(&env, Error::PolicyNotActive);
+            panic_with_error!(env, Error::PolicyNotActive);
         }
 
         // Guard: reject expired policies even if status hasn't been updated yet.
@@ -382,17 +382,17 @@ impl ClaimsProcessor {
         // Guard: reject claims outside the active coverage period
         let now = env.ledger().timestamp();
         if now < policy.start_time || now > policy.end_time {
-            panic_with_error!(&env, Error::ClaimOutsideCoveragePeriod);
+            panic_with_error!(env, Error::ClaimOutsideCoveragePeriod);
         }
 
         if policy.end_time > 0 {
-            let cutoff = policy.end_time.saturating_add(Self::claim_deadline(&env));
+            let cutoff = policy.end_time.saturating_add(Self::claim_deadline(env));
             if now > cutoff {
-                panic_with_error!(&env, Error::ClaimDeadlinePassed);
+                panic_with_error!(env, Error::ClaimDeadlinePassed);
             }
         }
 
-        let claim_id   = Self::next_claim_id(&env);
+        let claim_id   = Self::next_claim_id(env);
 
         // Issue #437: score this submission against the configured fraud
         // rules. In `Block` mode a high enough score panics here, before any
@@ -400,7 +400,7 @@ impl ClaimsProcessor {
         // world looks exactly as it did before the call. In `FlagOnly` mode
         // a FraudRecord is persisted and the claim proceeds. When no config
         // is set, this is a no-op.
-        Self::evaluate_fraud(&env, claim_id, &claimant, policy.coverage_amount);
+        Self::evaluate_fraud(env, claim_id, claimant, policy.coverage_amount);
 
         let claim = Claim {
             id: claim_id,
@@ -415,7 +415,7 @@ impl ClaimsProcessor {
             dispute_reason: None,
             paid_amount: None,
             partial_payout_bps: None,
-            installments: Vec::new(&env),
+            installments: Vec::new(env),
             payout_ready_at: None,
             identity_verified: false,
             verification_type: None,
@@ -427,12 +427,12 @@ impl ClaimsProcessor {
         env.storage().persistent().extend_ttl(&StorageKey::PolicyClaim(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
         let mut pending: Vec<u128> = env.storage().instance()
-            .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(&env));
+            .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(env));
         pending.push_back(claim_id);
         env.storage().instance().set(&StorageKey::PendingClaims, &pending);
 
         env.events().publish(
-            (Symbol::new(&env, "claim_submitted"),),
+            (Symbol::new(env, "claim_submitted"),),
             ClaimSubmitted {
                 claim_id,
                 policy_id,
@@ -446,12 +446,12 @@ impl ClaimsProcessor {
         // detector is on, but cheap enough to always maintain; keeping the
         // aggregate up to date lets an admin turn the detector on later
         // without every claimant looking like a first-time submitter.
-        let burst_window = Self::fraud_config(&env)
+        let burst_window = Self::fraud_config(env)
             .map(|c| c.burst_window_secs)
             .unwrap_or(0);
         Self::update_claimant_history(
-            &env,
-            &claimant,
+            env,
+            claimant,
             now,
             policy.coverage_amount,
             burst_window,
