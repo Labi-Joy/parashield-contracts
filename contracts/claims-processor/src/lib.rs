@@ -178,6 +178,10 @@ pub enum Error {
     /// A claim was filed outside the policy's coverage period — before
     /// `start_time` or after `end_time`.
     ClaimOutsideCoveragePeriod = 27,
+    /// The contract admin tried to file a claim, on any policy. The admin
+    /// resolves disputes and controls payout configuration; letting them
+    /// also be the claimant is self-dealing (issue #566).
+    AdminCannotBeClaimant = 28,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -321,13 +325,38 @@ impl ClaimsProcessor {
 
     /// Manually submit a claim for a policy. Returns the new claim ID.
     /// Only the policyholder may submit; only one claim per policy.
+    ///
+    /// The contract admin is refused outright (issue #566). An admin who
+    /// holds a policy is on both sides of the same claim: they file it,
+    /// they are the escalation/dispute resolver of last resort, and they
+    /// control the pool configuration the payout comes out of. Filing on
+    /// their own policy is self-dealing no matter how clean the oracle
+    /// trigger looks, so the conflict is removed rather than documented.
+    /// A policy the admin bought is still handled by the keeper-driven
+    /// `auto_process` path, which is not a claimant-initiated flow.
     pub fn submit_claim(env: Env, claimant: Address, policy_id: u128) -> u128 {
         claimant.require_auth();
         Self::require_not_paused(&env);
 
+        // The admin may not be the claimant, whoever the policyholder is.
+        // Checked before any state is read so a rejected call costs nothing.
+        Self::require_not_admin(&env, &claimant);
+
+        Self::file_claim(&env, &claimant, policy_id)
+    }
+
+    /// The claim-filing body shared by `submit_claim` and
+    /// `batch_submit_claims`. The caller has already authorized `claimant`,
+    /// checked the pause flag and rejected the admin — deliberately *not*
+    /// re-done here, because a second `require_auth` for the same address in
+    /// the same call frame is rejected by the host (`Auth, ExistingValue`).
+    /// `batch_submit_claims` delegating to `submit_claim` therefore made the
+    /// whole batch path unreachable for every caller; the shared body keeps
+    /// one set of rules instead of two copies of them.
+    fn file_claim(env: &Env, claimant: &Address, policy_id: u128) -> u128 {
         // Guard: one claim per policy
         if env.storage().persistent().has(&StorageKey::PolicyClaim(policy_id)) {
-            panic_with_error!(&env, Error::AlreadyClaimed);
+            panic_with_error!(env, Error::AlreadyClaimed);
         }
 
         // Verify policy is Active via Policy Engine
@@ -337,7 +366,7 @@ impl ClaimsProcessor {
         let policy = PolicyEngineClient::new(&env, &policy_engine)
             .get_policy(&policy_id);
 
-        if policy.policyholder != claimant {
+        if policy.policyholder != *claimant {
             panic_with_error!(&env, Error::Unauthorized);
         }
         if policy.status != parashield_policy_engine::PolicyStatus::Active {
@@ -435,6 +464,7 @@ impl ClaimsProcessor {
     pub fn batch_submit_claims(env: Env, claimant: Address, policy_ids: Vec<u128>) -> Vec<u128> {
         claimant.require_auth();
         Self::require_not_paused(&env);
+        Self::require_not_admin(&env, &claimant);
 
         let mut claim_ids = Vec::new(&env);
         let count = if policy_ids.len() > MAX_BATCH_SIZE {
@@ -445,7 +475,7 @@ impl ClaimsProcessor {
 
         for i in 0..count {
             let pid = policy_ids.get_unchecked(i);
-            let cid = Self::submit_claim(env.clone(), claimant.clone(), pid);
+            let cid = Self::file_claim(&env, &claimant, pid);
             claim_ids.push_back(cid);
         }
 
@@ -2012,6 +2042,20 @@ impl ClaimsProcessor {
             .unwrap_or(false);
         if paused {
             panic_with_error!(env, Error::Paused);
+        }
+    }
+
+    /// Panic with `AdminCannotBeClaimant` if `caller` is the contract admin.
+    ///
+    /// Separation of duties for the claimant side of a claim (issue #566).
+    /// Deliberately *not* `Unauthorized`: the admin is a privileged caller
+    /// everywhere else here, so a caller that trips this is doing something
+    /// the contract never allows rather than being unauthenticated, and
+    /// off-chain callers need to tell the two apart.
+    fn require_not_admin(env: &Env, caller: &Address) {
+        let admin: Option<Address> = env.storage().instance().get(&StorageKey::Admin);
+        if admin.as_ref() == Some(caller) {
+            panic_with_error!(env, Error::AdminCannotBeClaimant);
         }
     }
 

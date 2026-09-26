@@ -1480,3 +1480,67 @@ fn test_matching_claimant_still_settles() {
     let claim_id = cp.submit_claim(&buyer, &pol_id);
     assert_eq!(cp.process_claim(&w.keeper, &claim_id, &None), ClaimResult::Paid);
 }
+
+// ── Admin may not be the claimant (issue #566) ────────────────────────────────
+
+/// The admin holds the dispute-resolution pen and configures the pool the
+/// payout comes out of, so a claim they file themselves is self-dealing:
+/// there is no one left to review it. The restriction applies to the
+/// claimant, not to the policy, so an admin-owned policy is simply not
+/// claimable by its owner.
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_admin_cannot_file_claim_on_own_policy() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let pol_id = buy_crop_policy(&w, &w.admin, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .submit_claim(&w.admin, &pol_id);
+}
+
+/// The batch entry point must not be a way around the single-claim guard —
+/// it routes through `submit_claim`, and this pins that.
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_admin_cannot_file_claim_through_batch() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let pol_id = buy_crop_policy(&w, &w.admin, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .batch_submit_claims(&w.admin, &soroban_sdk::vec![&w.env, pol_id]);
+}
+
+/// A rejected admin submission leaves no claim behind: the check runs
+/// before any state is written, so the policy is still claimable by
+/// someone else and the id sequence did not advance.
+#[test]
+fn test_admin_claim_attempt_writes_nothing() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let pol_id = buy_crop_policy(&w, &w.admin, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    assert!(cp.try_submit_claim(&w.admin, &pol_id).is_err());
+    assert_eq!(cp.get_claim_id_for_policy(&pol_id), None);
+    assert_eq!(cp.get_pending_claims().len(), 0);
+}
+
+/// An ordinary policyholder is unaffected — the guard is scoped to the
+/// admin address, not to "whoever holds the policy".
+#[test]
+fn test_non_admin_policyholder_still_files_claim() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    assert_eq!(cp.process_claim(&w.keeper, &claim_id, &None), ClaimResult::Paid);
+}
