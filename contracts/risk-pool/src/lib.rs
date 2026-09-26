@@ -215,6 +215,8 @@ pub enum Error {
     InvalidCategory           = 41,
     /// The deposit amount is not a multiple of the minimum deposit unit (issue #524).
     InvalidAmount             = 42,
+    /// A provider already holds an LP NFT, so a second one must not be minted.
+    ProviderAlreadyHasNft     = 43,
 }
 
 #[contract]

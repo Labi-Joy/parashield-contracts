@@ -21,8 +21,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, BytesN,
-    Env, IntoVal, Symbol, SymbolStr, TryFromVal, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token, Address,
+    BytesN, Env, IntoVal, Symbol, SymbolStr, TryFromVal, Vec,
 };
 
 pub mod types;

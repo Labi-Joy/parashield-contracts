@@ -175,6 +175,9 @@ pub enum Error {
     RateLimitExceeded = 25,
     /// A payout larger than the policy's coverage amount was attempted (issue #550).
     PayoutExceedsCoverage = 26,
+    /// A claim was filed outside the policy's coverage period — before
+    /// `start_time` or after `end_time`.
+    ClaimOutsideCoveragePeriod = 27,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert

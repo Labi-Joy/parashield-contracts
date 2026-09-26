@@ -191,7 +191,7 @@ pub enum Error {
     /// Proposal has been vetoed by a guardian and can never be executed.
     ProposalVetoed = 43,
     /// `finalize_batch` was called with more proposals than allowed.
-    BatchTooLarge = 45,
+    BatchTooLarge = 46,
     /// `set_impact_multipliers` was called with a multiplier below
     /// `MIN_MULTIPLIER_BPS` (would de-escalate) or above `MAX_MULTIPLIER_BPS`
     /// (would brick proposal creation). Issue #438.
