@@ -179,6 +179,13 @@ pub enum Error {
     PayoutExceedsCoverage = 26,
     /// The caller is not in the authorized attesters list.
     UnauthorizedAttester = 27,
+    /// A claim was filed outside the policy's coverage period — before
+    /// `start_time` or after `end_time`.
+    ClaimOutsideCoveragePeriod = 28,
+    /// The contract admin tried to file a claim, on any policy. The admin
+    /// resolves disputes and controls payout configuration; letting them
+    /// also be the claimant is self-dealing (issue #566).
+    AdminCannotBeClaimant = 29,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -322,27 +329,53 @@ impl ClaimsProcessor {
 
     /// Manually submit a claim for a policy. Returns the new claim ID.
     /// Only the policyholder may submit; only one claim per policy.
+    ///
+    /// The contract admin is refused outright (issue #566). An admin who
+    /// holds a policy is on both sides of the same claim: they file it,
+    /// they are the escalation/dispute resolver of last resort, and they
+    /// control the pool configuration the payout comes out of. Filing on
+    /// their own policy is self-dealing no matter how clean the oracle
+    /// trigger looks, so the conflict is removed rather than documented.
+    /// A policy the admin bought is still handled by the keeper-driven
+    /// `auto_process` path, which is not a claimant-initiated flow.
     pub fn submit_claim(env: Env, claimant: Address, policy_id: u128) -> u128 {
         claimant.require_auth();
         Self::require_not_paused(&env);
 
+        // The admin may not be the claimant, whoever the policyholder is.
+        // Checked before any state is read so a rejected call costs nothing.
+        Self::require_not_admin(&env, &claimant);
+
+        Self::file_claim(&env, &claimant, policy_id)
+    }
+
+    /// The claim-filing body shared by `submit_claim` and
+    /// `batch_submit_claims`. The caller has already authorized `claimant`,
+    /// checked the pause flag and rejected the admin — deliberately
+    /// *not* re-done here, because a second `require_auth` for the same
+    /// address in the same call frame is rejected by the host
+    /// (`Auth, ExistingValue`). `batch_submit_claims` delegating to
+    /// `submit_claim` therefore made the whole batch path unreachable for
+    /// every caller; the shared body keeps one set of rules instead of two
+    /// copies of them.
+    fn file_claim(env: &Env, claimant: &Address, policy_id: u128) -> u128 {
         // Guard: one claim per policy
         if env.storage().persistent().has(&StorageKey::PolicyClaim(policy_id)) {
-            panic_with_error!(&env, Error::AlreadyClaimed);
+            panic_with_error!(env, Error::AlreadyClaimed);
         }
 
         // Verify policy is Active via Policy Engine
         let policy_engine: Address = env.storage().instance()
             .get(&StorageKey::PolicyEngine)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        let policy = PolicyEngineClient::new(&env, &policy_engine)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        let policy = PolicyEngineClient::new(env, &policy_engine)
             .get_policy(&policy_id);
 
-        if policy.policyholder != claimant {
-            panic_with_error!(&env, Error::Unauthorized);
+        if policy.policyholder != *claimant {
+            panic_with_error!(env, Error::Unauthorized);
         }
         if policy.status != parashield_policy_engine::PolicyStatus::Active {
-            panic_with_error!(&env, Error::PolicyNotActive);
+            panic_with_error!(env, Error::PolicyNotActive);
         }
 
         // Guard: reject expired policies even if status hasn't been updated yet.
@@ -354,17 +387,17 @@ impl ClaimsProcessor {
         // Guard: reject claims outside the active coverage period
         let now = env.ledger().timestamp();
         if now < policy.start_time || now > policy.end_time {
-            panic_with_error!(&env, Error::ClaimOutsideCoveragePeriod);
+            panic_with_error!(env, Error::ClaimOutsideCoveragePeriod);
         }
 
         if policy.end_time > 0 {
-            let cutoff = policy.end_time.saturating_add(Self::claim_deadline(&env));
+            let cutoff = policy.end_time.saturating_add(Self::claim_deadline(env));
             if now > cutoff {
-                panic_with_error!(&env, Error::ClaimDeadlinePassed);
+                panic_with_error!(env, Error::ClaimDeadlinePassed);
             }
         }
 
-        let claim_id   = Self::next_claim_id(&env);
+        let claim_id   = Self::next_claim_id(env);
 
         // Issue #437: score this submission against the configured fraud
         // rules. In `Block` mode a high enough score panics here, before any
@@ -372,7 +405,7 @@ impl ClaimsProcessor {
         // world looks exactly as it did before the call. In `FlagOnly` mode
         // a FraudRecord is persisted and the claim proceeds. When no config
         // is set, this is a no-op.
-        Self::evaluate_fraud(&env, claim_id, &claimant, policy.coverage_amount);
+        Self::evaluate_fraud(env, claim_id, claimant, policy.coverage_amount);
 
         let claim = Claim {
             id: claim_id,
@@ -387,7 +420,7 @@ impl ClaimsProcessor {
             dispute_reason: None,
             paid_amount: None,
             partial_payout_bps: None,
-            installments: Vec::new(&env),
+            installments: Vec::new(env),
             payout_ready_at: None,
             identity_verified: false,
             verification_type: None,
@@ -399,12 +432,12 @@ impl ClaimsProcessor {
         env.storage().persistent().extend_ttl(&StorageKey::PolicyClaim(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
         let mut pending: Vec<u128> = env.storage().instance()
-            .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(&env));
+            .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(env));
         pending.push_back(claim_id);
         env.storage().instance().set(&StorageKey::PendingClaims, &pending);
 
         env.events().publish(
-            (Symbol::new(&env, "claim_submitted"),),
+            (Symbol::new(env, "claim_submitted"),),
             ClaimSubmitted {
                 claim_id,
                 policy_id,
@@ -418,12 +451,12 @@ impl ClaimsProcessor {
         // detector is on, but cheap enough to always maintain; keeping the
         // aggregate up to date lets an admin turn the detector on later
         // without every claimant looking like a first-time submitter.
-        let burst_window = Self::fraud_config(&env)
+        let burst_window = Self::fraud_config(env)
             .map(|c| c.burst_window_secs)
             .unwrap_or(0);
         Self::update_claimant_history(
-            &env,
-            &claimant,
+            env,
+            claimant,
             now,
             policy.coverage_amount,
             burst_window,
@@ -436,6 +469,7 @@ impl ClaimsProcessor {
     pub fn batch_submit_claims(env: Env, claimant: Address, policy_ids: Vec<u128>) -> Vec<u128> {
         claimant.require_auth();
         Self::require_not_paused(&env);
+        Self::require_not_admin(&env, &claimant);
 
         let mut claim_ids = Vec::new(&env);
         let count = if policy_ids.len() > MAX_BATCH_SIZE {
@@ -446,7 +480,7 @@ impl ClaimsProcessor {
 
         for i in 0..count {
             let pid = policy_ids.get_unchecked(i);
-            let cid = Self::submit_claim(env.clone(), claimant.clone(), pid);
+            let cid = Self::file_claim(&env, &claimant, pid);
             claim_ids.push_back(cid);
         }
 
@@ -2094,6 +2128,20 @@ impl ClaimsProcessor {
             .unwrap_or(false);
         if paused {
             panic_with_error!(env, Error::Paused);
+        }
+    }
+
+    /// Panic with `AdminCannotBeClaimant` if `caller` is the contract admin.
+    ///
+    /// Separation of duties for the claimant side of a claim (issue #566).
+    /// Deliberately *not* `Unauthorized`: the admin is a privileged caller
+    /// everywhere else here, so a caller that trips this is doing something
+    /// the contract never allows rather than being unauthenticated, and
+    /// off-chain callers need to tell the two apart.
+    fn require_not_admin(env: &Env, caller: &Address) {
+        let admin: Option<Address> = env.storage().instance().get(&StorageKey::Admin);
+        if admin.as_ref() == Some(caller) {
+            panic_with_error!(env, Error::AdminCannotBeClaimant);
         }
     }
 

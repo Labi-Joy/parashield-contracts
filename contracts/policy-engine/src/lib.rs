@@ -21,8 +21,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, BytesN,
-    Env, IntoVal, Symbol, SymbolStr, TryFromVal, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token, Address,
+    BytesN, Env, IntoVal, Symbol, SymbolStr, TryFromVal, Vec,
 };
 
 pub mod types;
@@ -258,6 +258,11 @@ impl PolicyEngine {
 
     /// Admin-only: create a new insurance product and return its ID.
     /// `params.premium_rate_bps` must be 1-10000; `params.coverage_amount` must be positive.
+    ///
+    /// Coverage must describe a real, buyable range: `0 < coverage_min <
+    /// coverage_max` (issue #567). An inverted or zero-width range would
+    /// publish a product that `buy_policy` can never accept a policy for,
+    /// and a non-positive min would sell free cover.
     pub fn create_product(env: Env, admin: Address, params: CreateProductParams) -> u128 {
         Self::require_admin(&env, &admin);
 
@@ -296,7 +301,10 @@ impl PolicyEngine {
             panic_with_error!(&env, Error::InvalidTriggerThreshold);
         }
         // Coverage bounds must form a valid, positive range: 0 < min < max.
-        // Rejects free coverage (min == 0) and inverted ranges (min >= max).
+        // Rejects free coverage (min <= 0) and inverted or zero-width ranges
+        // (min >= max), which `buy_policy` could never satisfy (issue #567).
+        // A non-positive `max` cannot satisfy the same inequality, so it
+        // needs no separate branch.
         if params.coverage_min <= 0 || params.coverage_min >= params.coverage_max {
             panic_with_error!(&env, Error::InvalidCoverageRange);
         }

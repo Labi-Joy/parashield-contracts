@@ -24,6 +24,11 @@ struct World {
     policy_id: Address,
     claims_id: Address,
     pool_id:   Address,
+    /// Third-party LP that funds the pool. The risk pool refuses to let its
+    /// admin take an LP position (issue #568), so the pool's capital has to
+    /// come from somewhere else — and tests that want a solvent pool have to
+    /// say who is providing it.
+    lp:        Address,
 }
 
 fn deploy() -> World {
@@ -34,6 +39,7 @@ fn deploy() -> World {
     let admin  = Address::generate(&env);
     let keeper = Address::generate(&env);
     let oracle_wallet = Address::generate(&env);
+    let lp = Address::generate(&env);
 
     let usdc = env.register_stellar_asset_contract_v2(admin.clone()).address();
 
@@ -80,7 +86,7 @@ fn deploy() -> World {
     PolicyEngineClient::new(&env, &policy_id)
         .set_claims_processor(&admin, &claims_id);
 
-    World { env, admin, keeper, oracle_w: oracle_wallet, usdc, oracle_id, policy_id, claims_id, pool_id }
+    World { env, admin, keeper, oracle_w: oracle_wallet, usdc, oracle_id, policy_id, claims_id, pool_id, lp }
 }
 
 fn create_crop_product(w: &World) -> u128 {
@@ -104,9 +110,11 @@ fn create_crop_product(w: &World) -> u128 {
 
 fn buy_crop_policy(w: &World, buyer: &Address, product_id: u128) -> u128 {
     StellarAssetClient::new(&w.env, &w.usdc).mint(buyer, &5_000_000_000i128);
-    // Fund the pool and policy contract with coverage capital
-    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.admin, &1_000_000_000i128);
-    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&w.admin, &1_000_000_000i128, &0i128, &false);
+    // Fund the pool with coverage capital. The LP must not be the admin:
+    // RiskPool rejects an admin deposit (issue #568), because the admin also
+    // sets the pool's risk parameters and can authorise emergency exits.
+    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.lp, &1_000_000_000i128);
+    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&w.lp, &1_000_000_000i128, &0i128, &false);
     StellarAssetClient::new(&w.env, &w.usdc).mint(&w.policy_id, &10_000_000_000i128);
     
     let policy_id = PolicyEngineClient::new(&w.env, &w.policy_id)
@@ -1470,6 +1478,70 @@ fn test_mismatched_claim_stays_pending_and_unpaid() {
 /// Unchanged holder: settlement still pays out as before.
 #[test]
 fn test_matching_claimant_still_settles() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let buyer  = Address::generate(&w.env);
+    let pol_id = buy_crop_policy(&w, &buyer, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    let claim_id = cp.submit_claim(&buyer, &pol_id);
+    assert_eq!(cp.process_claim(&w.keeper, &claim_id, &None), ClaimResult::Paid);
+}
+
+// ── Admin may not be the claimant (issue #566) ────────────────────────────────
+
+/// The admin holds the dispute-resolution pen and configures the pool the
+/// payout comes out of, so a claim they file themselves is self-dealing:
+/// there is no one left to review it. The restriction applies to the
+/// claimant, not to the policy, so an admin-owned policy is simply not
+/// claimable by its owner.
+#[test]
+#[should_panic(expected = "Error(Contract, #29)")]
+fn test_admin_cannot_file_claim_on_own_policy() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let pol_id = buy_crop_policy(&w, &w.admin, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .submit_claim(&w.admin, &pol_id);
+}
+
+/// The batch entry point must not be a way around the single-claim guard —
+/// it routes through `submit_claim`, and this pins that.
+#[test]
+#[should_panic(expected = "Error(Contract, #29)")]
+fn test_admin_cannot_file_claim_through_batch() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let pol_id = buy_crop_policy(&w, &w.admin, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    ClaimsProcessorClient::new(&w.env, &w.claims_id)
+        .batch_submit_claims(&w.admin, &soroban_sdk::vec![&w.env, pol_id]);
+}
+
+/// A rejected admin submission leaves no claim behind: the check runs
+/// before any state is written, so the policy is still claimable by
+/// someone else and the id sequence did not advance.
+#[test]
+fn test_admin_claim_attempt_writes_nothing() {
+    let w      = deploy();
+    let pid    = create_crop_product(&w);
+    let pol_id = buy_crop_policy(&w, &w.admin, pid);
+    submit_rainfall(&w, 20_000_000);
+
+    let cp = ClaimsProcessorClient::new(&w.env, &w.claims_id);
+    assert!(cp.try_submit_claim(&w.admin, &pol_id).is_err());
+    assert_eq!(cp.get_claim_id_for_policy(&pol_id), None);
+    assert_eq!(cp.get_pending_claims().len(), 0);
+}
+
+/// An ordinary policyholder is unaffected — the guard is scoped to the
+/// admin address, not to "whoever holds the policy".
+#[test]
+fn test_non_admin_policyholder_still_files_claim() {
     let w      = deploy();
     let pid    = create_crop_product(&w);
     let buyer  = Address::generate(&w.env);
