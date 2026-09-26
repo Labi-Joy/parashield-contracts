@@ -125,6 +125,13 @@ enum StorageKey {
     /// A frozen snapshot of the fraud detector's judgement on one claim
     /// (issue #437). Written only when the detector flagged something.
     FraudRecord(u128),
+    /// SECURITY FIX: Rate limiting for auto_process function
+    /// Maps policy_id to the last timestamp it was processed to prevent spam.
+    AutoProcessLastTime(u128),
+    /// SECURITY FIX: Minimum cooldown in seconds between auto_process calls for the same policy.
+    AutoProcessCooldown,
+    /// Authorized identity attesters list (Vec<Address>).
+    AuthorizedAttesters,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -159,9 +166,26 @@ pub enum Error {
     /// Identity verification required for this claim category but not verified.
     IdentityVerificationRequired = 21,
     InvalidInput = 22,
+    /// Fraud detector flagged this claim's submission and the current
+    /// `FraudMode` is `Block` (issue #437). No state was written for the
+    /// rejected claim.
+    FraudSuspected = 23,
     /// An admin transfer was proposed while another one is still pending,
     /// which would reset the transfer timelock (issue #457).
-    AdminTransferPending = 23,
+    AdminTransferPending = 24,
+    /// SECURITY FIX: Rate limiting - auto_process called too frequently for this policy.
+    RateLimitExceeded = 25,
+    /// A payout larger than the policy's coverage amount was attempted (issue #550).
+    PayoutExceedsCoverage = 26,
+    /// The caller is not in the authorized attesters list.
+    UnauthorizedAttester = 27,
+    /// A claim was filed outside the policy's coverage period — before
+    /// `start_time` or after `end_time`.
+    ClaimOutsideCoveragePeriod = 28,
+    /// The contract admin tried to file a claim, on any policy. The admin
+    /// resolves disputes and controls payout configuration; letting them
+    /// also be the claimant is self-dealing (issue #566).
+    AdminCannotBeClaimant = 29,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -174,6 +198,11 @@ const LEDGER_SECONDS: u64 = 5;
 /// policy durations plus dispute-resolution time; capped to the network's
 /// max TTL at call time so `extend_ttl` never panics.
 const CLAIM_RETENTION_SECONDS: u64 = 365 * 24 * 60 * 60;
+
+/// Maximum number of installments allowed per claim. An excessive number
+/// of installments could exhaust storage and gas. 12 monthly installments
+/// (one year) is a reasonable upper bound for parametric insurance payouts.
+const MAX_INSTALLMENTS: u32 = 12;
 
 /// How long a claim may sit Pending before anyone can escalate it, when the
 /// admin has not configured a threshold.
@@ -300,27 +329,53 @@ impl ClaimsProcessor {
 
     /// Manually submit a claim for a policy. Returns the new claim ID.
     /// Only the policyholder may submit; only one claim per policy.
+    ///
+    /// The contract admin is refused outright (issue #566). An admin who
+    /// holds a policy is on both sides of the same claim: they file it,
+    /// they are the escalation/dispute resolver of last resort, and they
+    /// control the pool configuration the payout comes out of. Filing on
+    /// their own policy is self-dealing no matter how clean the oracle
+    /// trigger looks, so the conflict is removed rather than documented.
+    /// A policy the admin bought is still handled by the keeper-driven
+    /// `auto_process` path, which is not a claimant-initiated flow.
     pub fn submit_claim(env: Env, claimant: Address, policy_id: u128) -> u128 {
         claimant.require_auth();
         Self::require_not_paused(&env);
 
+        // The admin may not be the claimant, whoever the policyholder is.
+        // Checked before any state is read so a rejected call costs nothing.
+        Self::require_not_admin(&env, &claimant);
+
+        Self::file_claim(&env, &claimant, policy_id)
+    }
+
+    /// The claim-filing body shared by `submit_claim` and
+    /// `batch_submit_claims`. The caller has already authorized `claimant`,
+    /// checked the pause flag and rejected the admin — deliberately
+    /// *not* re-done here, because a second `require_auth` for the same
+    /// address in the same call frame is rejected by the host
+    /// (`Auth, ExistingValue`). `batch_submit_claims` delegating to
+    /// `submit_claim` therefore made the whole batch path unreachable for
+    /// every caller; the shared body keeps one set of rules instead of two
+    /// copies of them.
+    fn file_claim(env: &Env, claimant: &Address, policy_id: u128) -> u128 {
         // Guard: one claim per policy
         if env.storage().persistent().has(&StorageKey::PolicyClaim(policy_id)) {
-            panic_with_error!(&env, Error::AlreadyClaimed);
+            panic_with_error!(env, Error::AlreadyClaimed);
         }
 
         // Verify policy is Active via Policy Engine
         let policy_engine: Address = env.storage().instance()
             .get(&StorageKey::PolicyEngine)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
-        let policy = PolicyEngineClient::new(&env, &policy_engine)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        let policy = PolicyEngineClient::new(env, &policy_engine)
             .get_policy(&policy_id);
 
-        if policy.policyholder != claimant {
-            panic_with_error!(&env, Error::Unauthorized);
+        if policy.policyholder != *claimant {
+            panic_with_error!(env, Error::Unauthorized);
         }
         if policy.status != parashield_policy_engine::PolicyStatus::Active {
-            panic_with_error!(&env, Error::PolicyNotActive);
+            panic_with_error!(env, Error::PolicyNotActive);
         }
 
         // Guard: reject expired policies even if status hasn't been updated yet.
@@ -329,15 +384,20 @@ impl ClaimsProcessor {
         // for a bounded window after the policy ends (`claim_deadline`); once
         // that window closes the triggering event is too old to act on and the
         // submission is rejected (issue #386).
+        // Guard: reject claims outside the active coverage period
         let now = env.ledger().timestamp();
+        if now < policy.start_time || now > policy.end_time {
+            panic_with_error!(env, Error::ClaimOutsideCoveragePeriod);
+        }
+
         if policy.end_time > 0 {
-            let cutoff = policy.end_time.saturating_add(Self::claim_deadline(&env));
+            let cutoff = policy.end_time.saturating_add(Self::claim_deadline(env));
             if now > cutoff {
-                panic_with_error!(&env, Error::ClaimDeadlinePassed);
+                panic_with_error!(env, Error::ClaimDeadlinePassed);
             }
         }
 
-        let claim_id   = Self::next_claim_id(&env);
+        let claim_id   = Self::next_claim_id(env);
 
         // Issue #437: score this submission against the configured fraud
         // rules. In `Block` mode a high enough score panics here, before any
@@ -345,7 +405,7 @@ impl ClaimsProcessor {
         // world looks exactly as it did before the call. In `FlagOnly` mode
         // a FraudRecord is persisted and the claim proceeds. When no config
         // is set, this is a no-op.
-        Self::evaluate_fraud(&env, claim_id, &claimant, policy.coverage_amount);
+        Self::evaluate_fraud(env, claim_id, claimant, policy.coverage_amount);
 
         let claim = Claim {
             id: claim_id,
@@ -360,7 +420,7 @@ impl ClaimsProcessor {
             dispute_reason: None,
             paid_amount: None,
             partial_payout_bps: None,
-            installments: Vec::new(&env),
+            installments: Vec::new(env),
             payout_ready_at: None,
             identity_verified: false,
             verification_type: None,
@@ -372,12 +432,12 @@ impl ClaimsProcessor {
         env.storage().persistent().extend_ttl(&StorageKey::PolicyClaim(policy_id), TTL_THRESHOLD, TTL_EXTEND_TO);
 
         let mut pending: Vec<u128> = env.storage().instance()
-            .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(&env));
+            .get(&StorageKey::PendingClaims).unwrap_or_else(|| Vec::new(env));
         pending.push_back(claim_id);
         env.storage().instance().set(&StorageKey::PendingClaims, &pending);
 
         env.events().publish(
-            (Symbol::new(&env, "claim_submitted"),),
+            (Symbol::new(env, "claim_submitted"),),
             ClaimSubmitted {
                 claim_id,
                 policy_id,
@@ -391,12 +451,12 @@ impl ClaimsProcessor {
         // detector is on, but cheap enough to always maintain; keeping the
         // aggregate up to date lets an admin turn the detector on later
         // without every claimant looking like a first-time submitter.
-        let burst_window = Self::fraud_config(&env)
+        let burst_window = Self::fraud_config(env)
             .map(|c| c.burst_window_secs)
             .unwrap_or(0);
         Self::update_claimant_history(
-            &env,
-            &claimant,
+            env,
+            claimant,
             now,
             policy.coverage_amount,
             burst_window,
@@ -409,6 +469,7 @@ impl ClaimsProcessor {
     pub fn batch_submit_claims(env: Env, claimant: Address, policy_ids: Vec<u128>) -> Vec<u128> {
         claimant.require_auth();
         Self::require_not_paused(&env);
+        Self::require_not_admin(&env, &claimant);
 
         let mut claim_ids = Vec::new(&env);
         let count = if policy_ids.len() > MAX_BATCH_SIZE {
@@ -419,7 +480,7 @@ impl ClaimsProcessor {
 
         for i in 0..count {
             let pid = policy_ids.get_unchecked(i);
-            let cid = Self::submit_claim(env.clone(), claimant.clone(), pid);
+            let cid = Self::file_claim(&env, &claimant, pid);
             claim_ids.push_back(cid);
         }
 
@@ -435,6 +496,14 @@ impl ClaimsProcessor {
     }
 
     /// Process an existing pending claim. Reads oracle data and pays out or rejects.
+    ///
+    /// ## Parametric Payout Design Note
+    /// In parametric insurance, claim payouts are strictly binary or determined by
+    /// objective oracle trigger measurements (e.g., rainfall, wind speed, flight delay)
+    /// rather than traditional indemnity models that require loss adjustments or proof
+    /// of actual financial loss. When an oracle trigger condition is verified, the
+    /// contract pays out the pre-agreed coverage amount (or pre-configured partial
+    /// payout percentage) in full, regardless of the policyholder's actual incurred loss.
     ///
     /// `partial_payout_bps` is an optional payout ratio in basis points (0-10000).
     /// - `None` or `Some(10000)` → full coverage payment (default behavior).
@@ -513,6 +582,24 @@ impl ClaimsProcessor {
         Self::require_keeper(&env, &keeper);
         Self::require_not_paused(&env);
 
+        // SECURITY FIX: Rate limiting to prevent spam attacks on auto_process
+        // Check if this policy was recently processed and reject if within cooldown window
+        let now = env.ledger().timestamp();
+        let cooldown_secs: u64 = env.storage().instance()
+            .get(&StorageKey::AutoProcessCooldown)
+            .unwrap_or(300); // Default: 5 minutes between calls
+        
+        if let Some(last_processed) = env.storage().persistent()
+            .get::<_, u64>(&StorageKey::AutoProcessLastTime(policy_id)) {
+            if now < last_processed.saturating_add(cooldown_secs) {
+                panic_with_error!(&env, Error::RateLimitExceeded);
+            }
+        }
+        
+        // Update the last processed timestamp for this policy
+        env.storage().persistent()
+            .set(&StorageKey::AutoProcessLastTime(policy_id), &now);
+
         // ─── IDEMPOTENCY GUARD ───
         // Check if an evaluation record already exists for this policy in our storage
         if env.storage().persistent().has(&StorageKey::PolicyClaim(policy_id)) {
@@ -541,7 +628,6 @@ impl ClaimsProcessor {
         }
 
         // Check if policy has expired with no trigger
-        let now = env.ledger().timestamp();
         if now > policy.end_time {
             let risk_pool: Address = env.storage().instance()
                 .get(&StorageKey::RiskPool)
@@ -633,6 +719,9 @@ impl ClaimsProcessor {
     pub fn batch_auto_process(env: Env, caller: Address, limit: u32) -> Vec<(u128, ClaimResult)> {
         Self::require_keeper(&env, &caller);
         Self::require_not_paused(&env);
+        if limit == 0 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
         let pending: Vec<u128> = env.storage().instance()
             .get(&StorageKey::PendingClaims)
             .unwrap_or_else(|| Vec::new(&env));
@@ -681,7 +770,28 @@ impl ClaimsProcessor {
                 args,
             ) {
                 Ok(Ok(result)) => {
-                    results.push_back((claim_id, result));
+                    results.push_back((claim_id, result.clone()));
+                    
+                    // Emit individual claim processed event for tracking specific outcomes
+                    let claim: Option<Claim> = env.storage().persistent()
+                        .get(&StorageKey::Claim(claim_id));
+                    if let Some(c) = claim {
+                        let trigger_met = match &result {
+                            ClaimResult::Paid => true,
+                            ClaimResult::Rejected => false,
+                            ClaimResult::PartiallyPaid => true,
+                            _ => false,
+                        };
+                        env.events().publish(
+                            (Symbol::new(&env, "claim_processed"),),
+                            ClaimProcessed {
+                                claim_id,
+                                policy_id,
+                                trigger_met,
+                                status: c.status,
+                            },
+                        );
+                    }
                 }
                 // Sub-invocation failed or returned a contract error — skip
                 // this claim and continue processing the rest of the batch.
@@ -798,7 +908,7 @@ impl ClaimsProcessor {
     /// Parameters:
     /// - `claim_id`: The claim to schedule installments for
     /// - `amount_per_installment`: Amount to pay per installment
-    /// - `num_installments`: Total number of installments
+    /// - `num_installments`: Total number of installments (max 12)
     /// - `interval_seconds`: Seconds between each installment
     pub fn schedule_installments(
         env: Env,
@@ -810,6 +920,11 @@ impl ClaimsProcessor {
     ) {
         Self::require_keeper(&env, &caller);
         Self::require_not_paused(&env);
+
+        // Validate installment count to prevent storage/gas exhaustion
+        if num_installments == 0 || num_installments > MAX_INSTALLMENTS {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
 
         let mut claim = Self::get_claim(env.clone(), claim_id);
         
@@ -1515,6 +1630,12 @@ impl ClaimsProcessor {
         let paid_amount = claim.paid_amount
             .unwrap_or_else(|| panic_with_error!(&env, Error::ClaimNotFound));
 
+        // Re-check the cap at release time: the payout may never exceed the
+        // policy's coverage amount (issue #550).
+        if paid_amount > claim.coverage_amount {
+            panic_with_error!(&env, Error::PayoutExceedsCoverage);
+        }
+
         // Clear payout_ready_at so this cannot be called again
         claim.payout_ready_at = None;
         env.storage().persistent().set(&StorageKey::Claim(claim_id), &claim);
@@ -1669,15 +1790,75 @@ impl ClaimsProcessor {
         );
     }
 
-    /// Admin-only: manually verify a claimant's identity for a claim.
-    /// Used when off-chain identity verification is completed or approved by DAO.
+    /// Admin-only: add an address to the authorized attesters list.
+    pub fn add_authorized_attester(env: Env, admin: Address, attester: Address) {
+        Self::require_admin(&env, &admin);
+        let mut attesters: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::AuthorizedAttesters)
+            .unwrap_or_else(|| Vec::new(&env));
+        for i in 0..attesters.len() {
+            if attesters.get_unchecked(i) == attester {
+                return;
+            }
+        }
+        attesters.push_back(attester.clone());
+        env.storage()
+            .instance()
+            .set(&StorageKey::AuthorizedAttesters, &attesters);
+        env.events().publish(
+            (Symbol::new(&env, "attester_added"),),
+            attester,
+        );
+    }
+
+    /// Admin-only: remove an address from the authorized attesters list.
+    pub fn remove_authorized_attester(env: Env, admin: Address, attester: Address) {
+        Self::require_admin(&env, &admin);
+        let mut attesters: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::AuthorizedAttesters)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut idx: Option<u32> = None;
+        for i in 0..attesters.len() {
+            if attesters.get_unchecked(i) == attester {
+                idx = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = idx {
+            attesters.remove(i);
+            env.storage()
+                .instance()
+                .set(&StorageKey::AuthorizedAttesters, &attesters);
+        }
+        env.events().publish(
+            (Symbol::new(&env, "attester_removed"),),
+            attester,
+        );
+    }
+
+    /// Return the list of authorized attesters.
+    pub fn get_authorized_attesters(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::AuthorizedAttesters)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Verify a claimant's identity for a claim. Callable by admin or any
+    /// authorized attester. The caller must be either the contract admin or
+    /// an address previously added via `add_authorized_attester`.
     pub fn verify_claimant_identity(
         env: Env,
-        admin: Address,
+        attester: Address,
         claim_id: u128,
         id_type: Symbol,
     ) {
-        Self::require_admin(&env, &admin);
+        attester.require_auth();
+        Self::require_admin_or_attester(&env, &attester);
 
         let mut claim: Claim = env
             .storage()
@@ -1744,6 +1925,13 @@ impl ClaimsProcessor {
         if claim.status != ClaimStatus::Pending {
             panic_with_error!(env, Error::AlreadyProcessed);
         }
+        // Payout goes to the policy's holder, so the claim must still belong to
+        // them. `submit_claim` checks this at filing time; re-checking here
+        // closes the window where the policy changes hands (or a claim record
+        // otherwise disagrees with the policy) before settlement (issue #512).
+        if claim.claimant != policy.policyholder {
+            panic_with_error!(env, Error::Unauthorized);
+        }
         let oracle_verifier: Address = env.storage().instance()
             .get(&StorageKey::OracleVerifier)
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
@@ -1783,6 +1971,8 @@ impl ClaimsProcessor {
 
         let result = if trigger_met {
             // Determine payout: full or partial based on partial_payout_bps.
+            // Parametric model design: pays the pre-agreed coverage amount (or pre-set partial bps)
+            // automatically when the oracle condition is verified, without assessing post-hoc actual loss.
             let bps = partial_payout_bps.unwrap_or(10_000);
             let effective_bps = if bps > 10_000 { 10_000 } else { bps };
             let now = env.ledger().timestamp();
@@ -1807,6 +1997,10 @@ impl ClaimsProcessor {
             } else {
                 // Partial payment: calculate proportional payout
                 let paid = claim.coverage_amount * (effective_bps as i128) / 10_000;
+                // A payout can never exceed the policy's coverage (issue #550).
+                if paid > claim.coverage_amount {
+                    panic_with_error!(env, Error::PayoutExceedsCoverage);
+                }
                 claim.status = ClaimStatus::PartiallyPaid;
                 claim.paid_amount = Some(paid);
                 claim.partial_payout_bps = Some(effective_bps);
@@ -1906,6 +2100,27 @@ impl ClaimsProcessor {
         caller.require_auth();
     }
 
+    /// Panic unless `caller` is the admin or an authorized attester.
+    fn require_admin_or_attester(env: &Env, caller: &Address) {
+        let admin: Address = env.storage().instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        if *caller == admin {
+            return;
+        }
+        let attesters: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::AuthorizedAttesters)
+            .unwrap_or_else(|| Vec::new(env));
+        for i in 0..attesters.len() {
+            if attesters.get_unchecked(i) == *caller {
+                return;
+            }
+        }
+        panic_with_error!(env, Error::UnauthorizedAttester);
+    }
+
     /// Panic if the contract is currently paused.
     fn require_not_paused(env: &Env) {
         let paused: bool = env.storage().instance()
@@ -1913,6 +2128,20 @@ impl ClaimsProcessor {
             .unwrap_or(false);
         if paused {
             panic_with_error!(env, Error::Paused);
+        }
+    }
+
+    /// Panic with `AdminCannotBeClaimant` if `caller` is the contract admin.
+    ///
+    /// Separation of duties for the claimant side of a claim (issue #566).
+    /// Deliberately *not* `Unauthorized`: the admin is a privileged caller
+    /// everywhere else here, so a caller that trips this is doing something
+    /// the contract never allows rather than being unauthenticated, and
+    /// off-chain callers need to tell the two apart.
+    fn require_not_admin(env: &Env, caller: &Address) {
+        let admin: Option<Address> = env.storage().instance().get(&StorageKey::Admin);
+        if admin.as_ref() == Some(caller) {
+            panic_with_error!(env, Error::AdminCannotBeClaimant);
         }
     }
 

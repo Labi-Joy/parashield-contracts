@@ -98,6 +98,48 @@ fn test_double_initialize_panics() {
     PolicyEngineClient::new(&env, &contract_id).initialize(&admin, &usdc, &oracle);
 }
 
+#[test]
+#[should_panic(expected = "Error(Contract, #35)")]
+fn test_create_product_binary_invalid_comparison_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let params = CreateProductParams {
+        name: symbol_short!("flight_1"),
+        category: symbol_short!("flight"),
+        oracle_key: symbol_short!("f123"),
+        trigger_type: TriggerType::Binary,
+        oracle_data_type: symbol_short!("flight"),
+        trigger_threshold: 1_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min: 100_000_000,
+        coverage_max: 10_000_000_000,
+        premium_rate_bps: 500,
+        max_duration_days: 365,
+    };
+    client.create_product(&admin, &params);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #35)")]
+fn test_create_product_threshold_invalid_comparison_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let params = CreateProductParams {
+        name: symbol_short!("crop_1"),
+        category: symbol_short!("crop"),
+        oracle_key: symbol_short!("c123"),
+        trigger_type: TriggerType::Threshold,
+        oracle_data_type: symbol_short!("weather"),
+        trigger_threshold: 50_000_000,
+        trigger_comparison: TriggerComparison::Equal,
+        coverage_min: 100_000_000,
+        coverage_max: 10_000_000_000,
+        premium_rate_bps: 500,
+        max_duration_days: 365,
+    };
+    client.create_product(&admin, &params);
+}
+
 // ── Product management ────────────────────────────────────────────────────────
 
 #[test]
@@ -271,6 +313,81 @@ fn test_buy_policy_records_correct_fields() {
         policy.end_time,
         1_748_736_000u64 + (duration_days as u64) * 86_400
     );
+}
+
+/// Issue #522: `buy_policy` takes no start time; a policy always starts at the
+/// current ledger time and can never be backdated.
+#[test]
+fn test_buy_policy_start_time_is_current_ledger_time() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_748_736_000);
+    let first = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+    env.ledger().with_mut(|l| l.timestamp = 1_748_736_000 + 86_400);
+    let second = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
+
+    let p1 = client.get_policy(&first);
+    let p2 = client.get_policy(&second);
+    assert_eq!(p1.start_time, 1_748_736_000);
+    assert_eq!(p2.start_time, 1_748_736_000 + 86_400);
+    assert!(p2.start_time >= p1.start_time);
+}
+
+/// Issue #522: a scheduled policy starts at the requested future time.
+#[test]
+fn test_buy_policy_scheduled_future_start() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_748_736_000);
+    let start = 1_748_736_000 + 7 * 86_400;
+    let id = client.buy_policy_scheduled(
+        &buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"), &start,
+    );
+    let p = client.get_policy(&id);
+    assert_eq!(p.start_time, start);
+    assert_eq!(p.end_time, start + 30 * 86_400);
+    assert_eq!(p.created_at, 1_748_736_000);
+}
+
+/// Issue #522: a start equal to the current ledger time is accepted.
+#[test]
+fn test_buy_policy_scheduled_start_now_ok() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_748_736_000);
+    let id = client.buy_policy_scheduled(
+        &buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"), &1_748_736_000u64,
+    );
+    assert_eq!(client.get_policy(&id).start_time, 1_748_736_000);
+}
+
+/// Issue #522: a backdated start is rejected and no premium is taken.
+#[test]
+fn test_buy_policy_scheduled_past_start_rejected() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid = create_crop_product(&env, &client, &admin);
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    env.ledger().with_mut(|l| l.timestamp = 1_748_736_000);
+    let res = client.try_buy_policy_scheduled(
+        &buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"), &1_748_735_999u64,
+    );
+    assert_eq!(res.unwrap_err().unwrap(), soroban_sdk::Error::from_contract_error(Error::InvalidStartTime as u32));
+    assert_eq!(TokenClient::new(&env, &usdc).balance(&buyer), 1_000_000_000i128);
 }
 
 #[test]
@@ -448,7 +565,7 @@ fn test_cancel_policy_refunds_premium() {
     let buyer_before = TokenClient::new(&env, &usdc).balance(&buyer);
 
     let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
-    client.cancel_policy(&buyer, &policy_id);
+    client.cancel_policy(&buyer, &policy_id, &soroban_sdk::Bytes::new(&env));
 
     let buyer_after = TokenClient::new(&env, &usdc).balance(&buyer);
     assert_eq!(buyer_after, buyer_before); // premium returned in full
@@ -485,7 +602,7 @@ fn test_cancel_expired_policy_after_end_time() {
     let buyer_before = TokenClient::new(&env, &usdc).balance(&buyer);
     
     // Cancel the expired policy
-    let refund = client.cancel_policy(&buyer, &policy_id);
+    let refund = client.cancel_policy(&buyer, &policy_id, &soroban_sdk::Bytes::new(&env));
     assert_eq!(refund, 0, "fully-elapsed policy must refund nothing");
     assert_eq!(
         client.get_policy(&policy_id).status,
@@ -503,7 +620,7 @@ fn test_non_policyholder_cannot_cancel() {
     let impostor = Address::generate(&env);
     StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
     let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &30u32, &symbol_short!("kis2606"));
-    client.cancel_policy(&impostor, &policy_id);
+    client.cancel_policy(&impostor, &policy_id, &soroban_sdk::Bytes::new(&env));
 }
 
 // ── Re-entrancy / double-processing guard (Issue #1) ─────────────────────────
@@ -916,21 +1033,24 @@ fn sequential_create_product_ids_are_unique_and_monotone() {
     let id1 = client.create_product(
         &admin,
         &CreateProductParams {
-            oracle_key: symbol_short!("k1"),
+            name: symbol_short!("prod_1"),
+            oracle_key: symbol_short!("k01"),
             ..params(0)
         },
     );
     let id2 = client.create_product(
         &admin,
         &CreateProductParams {
-            oracle_key: symbol_short!("k2"),
+            name: symbol_short!("prod_2"),
+            oracle_key: symbol_short!("k02"),
             ..params(1)
         },
     );
     let id3 = client.create_product(
         &admin,
         &CreateProductParams {
-            oracle_key: symbol_short!("k3"),
+            name: symbol_short!("prod_3"),
+            oracle_key: symbol_short!("k03"),
             ..params(2)
         },
     );
@@ -977,7 +1097,7 @@ fn test_initial_version_is_one() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #23)")]
+#[should_panic(expected = "Error(Contract, #26)")]
 fn test_upgrade_to_same_version_panics() {
     let (env, admin, _oracle, _usdc, contract_id) = setup();
     let client = PolicyEngineClient::new(&env, &contract_id);
@@ -986,7 +1106,7 @@ fn test_upgrade_to_same_version_panics() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #23)")]
+#[should_panic(expected = "Error(Contract, #26)")]
 fn test_upgrade_to_lower_version_panics() {
     let (env, admin, _oracle, _usdc, contract_id) = setup();
     let client = PolicyEngineClient::new(&env, &contract_id);
@@ -1092,6 +1212,126 @@ fn test_create_product_single_char_oracle_key_panics() {
     );
 }
 
+/// Leading underscore in oracle_key must be rejected (Issue #491).
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_create_product_leading_underscore_oracle_key_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.create_product(
+        &admin,
+        &CreateProductParams {
+            name: symbol_short!("bad"),
+            category: symbol_short!("crop"),
+            oracle_key: symbol_short!("_crop"),
+            trigger_type: TriggerType::Threshold,
+            oracle_data_type: symbol_short!("weather"),
+            trigger_threshold: 50_000_000,
+            trigger_comparison: TriggerComparison::LessThan,
+            coverage_min: 100_000_000,
+            coverage_max: 10_000_000_000,
+            premium_rate_bps: 500,
+            max_duration_days: 365,
+        },
+    );
+}
+
+/// Trailing underscore in oracle_key must be rejected (Issue #491).
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_create_product_trailing_underscore_oracle_key_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.create_product(
+        &admin,
+        &CreateProductParams {
+            name: symbol_short!("bad"),
+            category: symbol_short!("crop"),
+            oracle_key: symbol_short!("crop_"),
+            trigger_type: TriggerType::Threshold,
+            oracle_data_type: symbol_short!("weather"),
+            trigger_threshold: 50_000_000,
+            trigger_comparison: TriggerComparison::LessThan,
+            coverage_min: 100_000_000,
+            coverage_max: 10_000_000_000,
+            premium_rate_bps: 500,
+            max_duration_days: 365,
+        },
+    );
+}
+
+/// Consecutive underscores in oracle_key must be rejected (Issue #491).
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_create_product_consecutive_underscores_oracle_key_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.create_product(
+        &admin,
+        &CreateProductParams {
+            name: symbol_short!("bad"),
+            category: symbol_short!("crop"),
+            oracle_key: symbol_short!("cr__op"),
+            trigger_type: TriggerType::Threshold,
+            oracle_data_type: symbol_short!("weather"),
+            trigger_threshold: 50_000_000,
+            trigger_comparison: TriggerComparison::LessThan,
+            coverage_min: 100_000_000,
+            coverage_max: 10_000_000_000,
+            premium_rate_bps: 500,
+            max_duration_days: 365,
+        },
+    );
+}
+
+/// oracle_key with no alphabetic characters must be rejected (Issue #491).
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_create_product_no_alphabetic_oracle_key_panics() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    client.create_product(
+        &admin,
+        &CreateProductParams {
+            name: symbol_short!("bad"),
+            category: symbol_short!("crop"),
+            oracle_key: symbol_short!("12345"),
+            trigger_type: TriggerType::Threshold,
+            oracle_data_type: symbol_short!("weather"),
+            trigger_threshold: 50_000_000,
+            trigger_comparison: TriggerComparison::LessThan,
+            coverage_min: 100_000_000,
+            coverage_max: 10_000_000_000,
+            premium_rate_bps: 500,
+            max_duration_days: 365,
+        },
+    );
+}
+
+/// Valid oracle_key with internal single underscore must be accepted (Issue #491).
+#[test]
+fn test_create_product_valid_underscore_oracle_key_succeeds() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let id = client.create_product(
+        &admin,
+        &CreateProductParams {
+            name: symbol_short!("ok"),
+            category: symbol_short!("crop"),
+            oracle_key: symbol_short!("cr_op_1"),
+            trigger_type: TriggerType::Threshold,
+            oracle_data_type: symbol_short!("weather"),
+            trigger_threshold: 50_000_000,
+            trigger_comparison: TriggerComparison::LessThan,
+            coverage_min: 100_000_000,
+            coverage_max: 10_000_000_000,
+            premium_rate_bps: 500,
+            max_duration_days: 365,
+        },
+    );
+    assert!(id > 0);
+}
+
 // ── Issue #202: buy_policy minimum duration boundary (duration_days == 1) ─────
 
 #[test]
@@ -1130,6 +1370,35 @@ fn test_buy_policy_minimum_duration_one_day() {
     assert_eq!(buyer_before - buyer_after, expected_premium);
 }
 
+/// Issue #526: buy_policy must reject zero duration with InvalidDurationRange (#19).
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")]
+fn test_buy_policy_zero_duration_rejected() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid    = create_crop_product(&env, &client, &admin);
+
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    client.buy_policy(&buyer, &pid, &COVERAGE, &0u32, &symbol_short!("kis2606"));
+}
+
+/// Issue #526: purchased policy must always satisfy end_time > start_time.
+#[test]
+fn test_buy_policy_end_time_exceeds_start_time() {
+    let (env, admin, _oracle, usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    let pid    = create_crop_product(&env, &client, &admin);
+
+    let buyer = Address::generate(&env);
+    StellarAssetClient::new(&env, &usdc).mint(&buyer, &1_000_000_000i128);
+
+    let policy_id = client.buy_policy(&buyer, &pid, &COVERAGE, &7u32, &symbol_short!("kis2606"));
+    let policy = client.get_policy(&policy_id);
+    assert!(policy.end_time > policy.start_time);
+}
+
 // ── Issue #203: cancel_policy zero-elapsed and zero-total-duration paths ──────
 
 #[test]
@@ -1161,7 +1430,7 @@ fn test_cancel_policy_zero_total_duration_refunds_full_premium() {
             .set(&StorageKey::Policy(policy_id), &policy);
     });
 
-    let refund = client.cancel_policy(&buyer, &policy_id);
+    let refund = client.cancel_policy(&buyer, &policy_id, &soroban_sdk::Bytes::new(&env));
     assert_eq!(
         refund, premium_paid,
         "total_duration == 0 must refund the full premium via the explicit branch"
@@ -1550,4 +1819,106 @@ fn test_non_admin_cannot_resume() {
     
     let stranger = Address::generate(&env);
     client.emergency_resume(&stranger);
+}
+
+// ── Coverage range must be a real range (issue #567) ───────────────────────────
+
+/// A product is only meaningful if a policyholder can actually buy
+/// something: `buy_policy` rejects any coverage below `coverage_min` or
+/// above `coverage_max` (line ~631). A product published with
+/// `coverage_min > coverage_max` therefore has an empty buyable set — the
+/// product exists, is listed as active, and can never be sold, which is
+/// indistinguishable from a broken product to an integrator.
+///
+/// `coverage_min == coverage_max` is the same defect by another route: a
+/// single reachable coverage amount, and only if the arithmetic lands
+/// exactly. `coverage_min <= 0` is worse still — free cover.
+fn params_with_coverage(min: i128, max: i128) -> CreateProductParams {
+    CreateProductParams {
+        name: symbol_short!("cov_rng"),
+        category: symbol_short!("crop"),
+        oracle_key: symbol_short!("kis2606"),
+        trigger_type: TriggerType::Threshold,
+        oracle_data_type: symbol_short!("weather"),
+        trigger_threshold: 50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min: min,
+        coverage_max: max,
+        premium_rate_bps: 500,
+        max_duration_days: 365,
+    }
+}
+
+/// The reported case: min strictly above max.
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn create_product_rejects_inverted_coverage_range() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    PolicyEngineClient::new(&env, &contract_id)
+        .create_product(&admin, &params_with_coverage(10_000_000_000, 100_000_000));
+}
+
+/// One unit of separation is still a range; only equality is rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn create_product_rejects_zero_width_coverage_range() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    PolicyEngineClient::new(&env, &contract_id)
+        .create_product(&admin, &params_with_coverage(1_000_000_000, 1_000_000_000));
+}
+
+/// Free cover, and inverted-by-sign nonsense, are the same invariant.
+#[test]
+fn create_product_rejects_zero_or_negative_coverage_min() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    assert!(client
+        .try_create_product(&admin, &params_with_coverage(0, 10_000_000_000))
+        .is_err());
+    assert!(client
+        .try_create_product(&admin, &params_with_coverage(-1, 10_000_000_000))
+        .is_err());
+}
+
+/// A non-positive `coverage_max` cannot satisfy `0 < min < max` either, so
+/// it is rejected by the same check without needing its own branch.
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn create_product_rejects_non_positive_coverage_max() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    PolicyEngineClient::new(&env, &contract_id)
+        .create_product(&admin, &params_with_coverage(100_000_000, 0));
+}
+
+/// The boundary must not be over-tight: adjacent bounds, and the smallest
+/// legal range, are both real products and must be accepted.
+#[test]
+fn create_product_accepts_narrow_but_valid_coverage_ranges() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+
+    let id = client.create_product(&admin, &params_with_coverage(1, 2));
+    let product = client.get_product(&id);
+    assert_eq!(product.coverage_min, 1);
+    assert_eq!(product.coverage_max, 2);
+
+    let mut wide = params_with_coverage(999_999, 1_000_000);
+    wide.name = symbol_short!("cov_rng2");
+    wide.oracle_key = symbol_short!("kis2607");
+    let id = client.create_product(&admin, &wide);
+    assert_eq!(client.get_product(&id).coverage_min, 999_999);
+}
+
+/// A rejected product must leave nothing behind — no active product, and
+/// no product id consumed — so a later valid create still gets id 1.
+#[test]
+fn rejected_coverage_range_writes_nothing() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+
+    assert!(client
+        .try_create_product(&admin, &params_with_coverage(10_000_000_000, 1_000_000_000))
+        .is_err());
+    assert_eq!(client.get_active_products().len(), 0);
+    assert_eq!(client.create_product(&admin, &params_with_coverage(1_000, 2_000)), 1);
 }

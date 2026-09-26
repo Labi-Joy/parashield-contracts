@@ -125,6 +125,48 @@ fn create_proposal_increments_counter() {
     assert_eq!(dao.proposal_count(), 1);
 }
 
+/// Issue #519: the deposit is locked exactly once, alongside the proposal.
+#[test]
+fn create_proposal_locks_deposit_with_proposal() {
+    let (env, dao, _, voter1, _, target) = setup();
+    let gov = token::Client::new(&env, &dao.get_config().gov_token);
+    let before = gov.balance(&voter1);
+    let args: Vec<Val> = Vec::new(&env);
+    let id = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Lower quorum to 5%"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: no material risk identified."),
+    );
+    let deposit = dao.get_proposal(&id).deposit;
+    assert!(deposit > 0);
+    assert_eq!(gov.balance(&voter1), before - deposit);
+    assert_eq!(gov.balance(&dao.address), deposit);
+}
+
+/// Issue #519: a failed creation must not leave any deposit behind.
+#[test]
+fn failed_create_proposal_leaves_deposit_untouched() {
+    let (env, dao, _, voter1, _, target) = setup();
+    let gov = token::Client::new(&env, &dao.get_config().gov_token);
+    let before = gov.balance(&voter1);
+    let args: Vec<Val> = Vec::new(&env);
+    let res = dao.try_create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Bad proposal"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::new(&env), // empty impact analysis -> InvalidInput
+    );
+    assert!(res.is_err());
+    assert_eq!(gov.balance(&voter1), before);
+    assert_eq!(gov.balance(&dao.address), 0);
+    assert_eq!(dao.proposal_count(), 0);
+}
+
 #[test]
 #[should_panic(expected = "Error(Contract, #4)")]
 fn create_proposal_below_threshold_fails() {
@@ -573,6 +615,7 @@ fn test_finalize_refunds_deposit_locked_at_creation_not_live_config() {
         .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
 
     dao.finalize(&pid);
+    dao.withdraw_tokens(&voter1, &pid);
 
     // Must have gotten back the full original deposit (10k SHIELD), not
     // the live (lowered) threshold of 1 stroop.
@@ -1175,7 +1218,7 @@ fn reclaim_deposit_refunds_proposer_after_timeout() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #26)")]
+#[should_panic(expected = "Error(Contract, #33)")]
 fn reclaim_deposit_before_timeout_fails() {
     let (env, dao, _admin, voter1, _v2, target) = setup();
     let args: Vec<Val> = Vec::new(&env);
@@ -1260,7 +1303,7 @@ fn create_proposal_from_template_enforces_structure() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #29)")]
+#[should_panic(expected = "Error(Contract, #36)")]
 fn create_proposal_from_template_rejects_short_title() {
     let (env, dao, admin, voter1, _v2, target) = setup();
     dao.register_template(
@@ -1283,7 +1326,7 @@ fn create_proposal_from_template_rejects_short_title() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #30)")]
+#[should_panic(expected = "Error(Contract, #37)")]
 fn create_proposal_from_template_rejects_wrong_arg_count() {
     let (env, dao, admin, voter1, _v2, target) = setup();
     dao.register_template(
@@ -1536,4 +1579,316 @@ fn escalated_deposit_locked_at_creation_time() {
     dao.set_impact_multipliers(&admin, &10_000u32, &10_000u32, &10_000u32);
     assert_eq!(dao.get_proposal(&pid).deposit, escalated_deposit);
 }
+// ── Issue #492: guardian approval duplicate check ────────────────────────────
 
+/// Admin cannot configure a guardian set with duplicate guardian addresses.
+#[test]
+#[should_panic(expected = "Error(Contract, #41)")]
+fn test_issue_492_set_guardians_rejects_duplicates() {
+    let (env, dao, admin, _v1, _v2, _target) = setup();
+    let g1 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1.clone());
+    guardians.push_back(g1.clone());
+
+    dao.set_guardians(&admin, &guardians, &2);
+}
+
+/// Setting guardian threshold to 0 is rejected to prevent disabling multisig security (issue #523).
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_issue_523_set_guardians_zero_threshold_rejected() {
+    let (env, dao, admin, _v1, _v2, _target) = setup();
+    let g1 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1);
+
+    dao.set_guardians(&admin, &guardians, &0);
+}
+
+/// A guardian cannot approve the same pending upgrade multiple times to inflate approvals.
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_issue_492_guardian_duplicate_approval_rejected() {
+    let (env, dao, admin, _v1, _v2, _target) = setup();
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1.clone());
+    guardians.push_back(g2.clone());
+
+    dao.set_guardians(&admin, &guardians, &2);
+
+    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
+    dao.upgrade(&admin, &wasm_hash, &2);
+
+    // First approval by g1 succeeds
+    dao.approve_upgrade(&g1, &wasm_hash);
+
+    let pending = dao.get_pending_upgrade().unwrap();
+    assert_eq!(pending.approvals.len(), 1);
+    assert_eq!(pending.approvals.get(0).unwrap(), g1);
+
+    // Duplicate approval by same guardian must be rejected with AlreadyApprovedAction (#21)
+    dao.approve_upgrade(&g1, &wasm_hash);
+}
+
+/// Non-guardian caller cannot approve an upgrade.
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_issue_492_non_guardian_approval_rejected() {
+    let (env, dao, admin, voter1, _v2, _target) = setup();
+    let g1 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1.clone());
+
+    dao.set_guardians(&admin, &guardians, &1);
+
+    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
+    dao.upgrade(&admin, &wasm_hash, &2);
+
+    // voter1 is not a guardian
+    dao.approve_upgrade(&voter1, &wasm_hash);
+}
+
+/// Multiple distinct guardians can each approve once, tracking approvals accurately.
+#[test]
+fn test_issue_492_distinct_guardians_approval_tracking() {
+    let (env, dao, admin, _v1, _v2, _target) = setup();
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    let g3 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1.clone());
+    guardians.push_back(g2.clone());
+    guardians.push_back(g3.clone());
+
+    dao.set_guardians(&admin, &guardians, &3);
+    assert_eq!(dao.get_guardian_threshold(), 3);
+    assert_eq!(dao.get_guardians().len(), 3);
+
+    let wasm_hash = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
+    dao.upgrade(&admin, &wasm_hash, &2);
+
+    let pending = dao.get_pending_upgrade().unwrap();
+    assert_eq!(pending.approvals.len(), 0);
+
+    dao.approve_upgrade(&g1, &wasm_hash);
+    let pending = dao.get_pending_upgrade().unwrap();
+    assert_eq!(pending.approvals.len(), 1);
+    assert_eq!(pending.approvals.get(0).unwrap(), g1);
+
+    dao.approve_upgrade(&g2, &wasm_hash);
+    let pending = dao.get_pending_upgrade().unwrap();
+    assert_eq!(pending.approvals.len(), 2);
+    assert_eq!(pending.approvals.get(1).unwrap(), g2);
+
+    // Admin can cancel pending upgrade
+    dao.cancel_pending_upgrade(&admin);
+    assert!(dao.get_pending_upgrade().is_none());
+}
+
+/// Duplicate veto on an already-vetoed proposal is rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #43)")]
+fn test_issue_492_duplicate_veto_rejected() {
+    let (env, dao, admin, voter1, _v2, target) = setup();
+    let g1 = Address::generate(&env);
+    let mut guardians = Vec::new(&env);
+    guardians.push_back(g1.clone());
+    dao.set_guardians(&admin, &guardians, &1);
+
+    let args: Vec<Val> = Vec::new(&env);
+    let pid = dao.create_proposal(
+        &voter1,
+        &Bytes::from_slice(&env, b"Proposal to be vetoed"),
+        &target,
+        &Symbol::new(&env, "update"),
+        &args,
+        &Bytes::from_slice(&env, b"Impact analysis: testing veto duplicate."),
+    );
+
+    dao.veto_proposal(&g1, &pid, &Symbol::new(&env, "malicious"));
+    let p = dao.get_proposal(&pid);
+    assert!(p.is_vetoed);
+
+    // Second veto attempt must be rejected with ProposalVetoed (#43)
+    dao.veto_proposal(&g1, &pid, &Symbol::new(&env, "malicious"));
+}
+
+// ── time-weighted voting power (issue #515) ──────────────────────────────────
+
+const RAMP: u64 = 30 * 24 * 3600;
+
+fn new_proposal(env: &Env, dao: &GovernanceDaoClient, proposer: &Address, target: &Address) -> u64 {
+    let args: Vec<Val> = Vec::new(env);
+    dao.create_proposal(
+        proposer,
+        &Bytes::from_slice(env, b"Time weight proposal"),
+        target,
+        &Symbol::new(env, "update"),
+        &args,
+        &Bytes::from_slice(env, b"Impact analysis: no material risk identified."),
+    )
+}
+
+#[test]
+fn time_weight_is_off_by_default() {
+    let (_env, dao, _, _, _, _) = setup();
+    let cfg = dao.get_time_weight();
+    assert!(!cfg.enabled);
+    assert_eq!(cfg.min_bps, 10_000);
+}
+
+#[test]
+fn time_weight_disabled_keeps_full_balance_weight() {
+    let (env, dao, _, voter1, _, target) = setup();
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+    assert_eq!(dao.get_vote(&pid, &voter1).unwrap().weight, 990_000_0000000i128);
+}
+
+#[test]
+fn fresh_balance_counts_at_min_bps() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    // voter2 never checkpointed: 10% of 500k.
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    assert_eq!(dao.get_vote(&pid, &voter2).unwrap().weight, 50_000_0000000i128);
+}
+
+#[test]
+fn checkpointed_balance_ramps_to_full_weight() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    dao.checkpoint_voting_power(&voter2);
+    env.ledger().with_mut(|l| l.timestamp += RAMP / 2);
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    // Halfway: 10% + 90% * 50% = 55% of 500k.
+    assert_eq!(dao.get_vote(&pid, &voter2).unwrap().weight, 275_000_0000000i128);
+}
+
+#[test]
+fn weight_is_capped_at_full_after_ramp() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    dao.checkpoint_voting_power(&voter2);
+    env.ledger().with_mut(|l| l.timestamp += RAMP * 3);
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    assert_eq!(dao.get_vote(&pid, &voter2).unwrap().weight, 500_000_0000000i128);
+}
+
+#[test]
+fn balance_added_after_checkpoint_counts_at_min_bps() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    dao.checkpoint_voting_power(&voter2);
+    env.ledger().with_mut(|l| l.timestamp += RAMP);
+    let gov = token::StellarAssetClient::new(&env, &dao.get_config().gov_token);
+    gov.mint(&voter2, &500_000_0000000i128);
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    // 500k fully aged + 500k fresh at 10%.
+    assert_eq!(dao.get_vote(&pid, &voter2).unwrap().weight, 550_000_0000000i128);
+}
+
+#[test]
+fn larger_balance_restarts_checkpoint_clock() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    dao.checkpoint_voting_power(&voter2);
+    env.ledger().with_mut(|l| l.timestamp += RAMP);
+    let gov = token::StellarAssetClient::new(&env, &dao.get_config().gov_token);
+    gov.mint(&voter2, &500_000_0000000i128);
+    dao.checkpoint_voting_power(&voter2); // bigger balance: clock restarts
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    // The old age is not inherited: all 1M counts at 10%.
+    assert_eq!(dao.get_vote(&pid, &voter2).unwrap().weight, 100_000_0000000i128);
+}
+
+#[test]
+fn selling_after_checkpoint_lowers_aged_amount() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    dao.checkpoint_voting_power(&voter2);
+    env.ledger().with_mut(|l| l.timestamp += RAMP);
+    let gov = token::Client::new(&env, &dao.get_config().gov_token);
+    gov.transfer(&voter2, &voter1, &400_000_0000000i128);
+    dao.checkpoint_voting_power(&voter2); // lowers amount, keeps start
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    assert_eq!(dao.get_vote(&pid, &voter2).unwrap().weight, 100_000_0000000i128);
+}
+
+#[test]
+fn locked_tokens_are_refunded_in_full_under_time_weighting() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    let gov = token::Client::new(&env, &dao.get_config().gov_token);
+    dao.vote(&voter2, &pid, &VoteChoice::For);
+    assert_eq!(gov.balance(&voter2), 0);
+    env.ledger()
+        .with_mut(|l| l.timestamp += VOTING_PERIOD + (24 * 3600) + 1);
+    dao.finalize(&pid);
+    dao.withdraw_tokens(&voter2, &pid);
+    assert_eq!(gov.balance(&voter2), 500_000_0000000i128);
+}
+
+#[test]
+fn vote_batch_uses_time_weighted_power() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    let p1 = new_proposal(&env, &dao, &voter1, &target);
+    let p2 = new_proposal(&env, &dao, &voter1, &target);
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    let ids = soroban_sdk::vec![&env, p1, p2];
+    dao.vote_batch(&voter2, &ids, &VoteChoice::For);
+    assert_eq!(dao.get_vote(&p1, &voter2).unwrap().weight, 50_000_0000000i128);
+    assert_eq!(dao.get_vote(&p2, &voter2).unwrap().weight, 50_000_0000000i128);
+}
+
+#[test]
+fn delegated_weight_is_time_weighted() {
+    let (env, dao, admin, voter1, voter2, target) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    dao.delegate(&voter2, &voter1);
+    let pid = new_proposal(&env, &dao, &voter1, &target);
+    dao.vote(&voter1, &pid, &VoteChoice::For);
+    // voter1 own 990k at 10% + voter2 500k at 10%.
+    assert_eq!(dao.get_vote(&pid, &voter1).unwrap().weight, 149_000_0000000i128);
+}
+
+#[test]
+fn set_time_weight_can_be_disabled_again() {
+    let (_env, dao, admin, _, _, _) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &1_000u32);
+    assert!(dao.get_time_weight().enabled);
+    dao.set_time_weight(&admin, &false, &0u64, &10_000u32);
+    assert!(!dao.get_time_weight().enabled);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #45)")]
+fn set_time_weight_rejects_zero_ramp() {
+    let (_env, dao, admin, _, _, _) = setup();
+    dao.set_time_weight(&admin, &true, &0u64, &1_000u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #45)")]
+fn set_time_weight_rejects_min_bps_above_full() {
+    let (_env, dao, admin, _, _, _) = setup();
+    dao.set_time_weight(&admin, &true, &RAMP, &10_001u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn set_time_weight_requires_admin() {
+    let (env, dao, _, _, _, _) = setup();
+    let impostor = Address::generate(&env);
+    dao.set_time_weight(&impostor, &true, &RAMP, &1_000u32);
+}

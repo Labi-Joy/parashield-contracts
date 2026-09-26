@@ -17,7 +17,6 @@
 // message.
 #![deny(clippy::panic)]
 #![no_std]
-extern crate alloc;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
@@ -75,6 +74,9 @@ const MAX_DELEGATORS: u32 = 50;
 /// would lower the deposit / weight requirement below the configured base,
 /// which is not what an escalation feature should ever do (issue #438).
 const MIN_MULTIPLIER_BPS: u32 = 10_000;
+
+/// Basis-point denominator for time-weighted voting power.
+const FULL_WEIGHT_BPS: u32 = 10_000;
 /// Impact-multiplier basis points ceiling: 100_000 = 10x. A single stray
 /// keystroke could otherwise brick proposal creation entirely by demanding
 /// more tokens than exist. Ten times the base is already an aggressive
@@ -108,6 +110,10 @@ enum StorageKey {
     PendingUpgrade,
     /// Adaptive-quorum settings (`QuorumDecayConfig`).
     QuorumDecay,
+    /// Time-weighted voting settings (`TimeWeightConfig`).
+    TimeWeight,
+    /// A holder's `WeightCheckpoint` — Address → WeightCheckpoint.
+    WeightCheckpoint(Address),
     /// Rolling turnout history used to compute adaptive quorum.
     Participation,
     /// Who an address has delegated its voting power to — Address → Address.
@@ -184,10 +190,15 @@ pub enum Error {
     ExecutionDeadlineExpired = 42,
     /// Proposal has been vetoed by a guardian and can never be executed.
     ProposalVetoed = 43,
+    /// `finalize_batch` was called with more proposals than allowed.
+    BatchTooLarge = 46,
     /// `set_impact_multipliers` was called with a multiplier below
     /// `MIN_MULTIPLIER_BPS` (would de-escalate) or above `MAX_MULTIPLIER_BPS`
     /// (would brick proposal creation). Issue #438.
     InvalidImpactMultiplier = 44,
+    /// `set_time_weight` was called with a zero ramp period or a `min_bps`
+    /// above 10_000. Issue #515.
+    InvalidTimeWeight = 45,
 }
 
 #[contract]
@@ -274,11 +285,12 @@ impl GovernanceDao {
         proposer.require_auth();
         Self::validate_stellar_address(&env, &target);
         
-        // Validate impact analysis is provided (non-empty)
+        // SECURITY FIX: Validate impact analysis length to prevent storage exhaustion.
+        // Limit to 4096 bytes — reasonable for a proposal description without enabling
+        // attacks that reserve huge storage or inflate transaction costs.
         if impact_analysis.is_empty() {
             panic_with_error!(&env, Error::InvalidInput);
         }
-        // Enforce maximum length for impact analysis (4096 bytes)
         if impact_analysis.len() > 4096 {
             panic_with_error!(&env, Error::InvalidInput);
         }
@@ -300,15 +312,6 @@ impl GovernanceDao {
         if weight < deposit {
             panic_with_error!(&env, Error::InsufficientWeight);
         }
-        // Lock the exact amount that gated this proposal; finalize() refunds
-        // it verbatim from the Proposal record, so a later change to the
-        // base threshold or the multipliers does not distort refunds already
-        // in flight.
-        gov_token.transfer(
-            &proposer,
-            &env.current_contract_address(),
-            &deposit,
-        );
 
         let proposal_id: u64 = env
             .storage()
@@ -354,6 +357,19 @@ impl GovernanceDao {
         env.storage()
             .instance()
             .set(&StorageKey::NextProposalId, &(proposal_id.checked_add(1).unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))));
+
+        // Issue #519: pull the deposit only after every check and state write
+        // above has succeeded, so a failure in proposal creation can never
+        // leave the proposer's tokens locked without a matching proposal.
+        // Lock the exact amount that gated this proposal; finalize() refunds
+        // it verbatim from the Proposal record, so a later change to the
+        // base threshold or the multipliers does not distort refunds already
+        // in flight.
+        gov_token.transfer(
+            &proposer,
+            &env.current_contract_address(),
+            &deposit,
+        );
 
         // Note: You can append `args` to your event payload if necessary
         env.events().publish(
@@ -414,7 +430,6 @@ impl GovernanceDao {
         if weight < deposit {
             panic_with_error!(&env, Error::InsufficientWeight);
         }
-        gov_token.transfer(&proposer, &env.current_contract_address(), &deposit);
 
         let proposal_id: u64 = env
             .storage()
@@ -467,6 +482,11 @@ impl GovernanceDao {
                 .checked_add(1)
                 .unwrap_or_else(|| panic_with_error!(&env, Error::LimitReached))),
         );
+
+        // Issue #519: pull the deposit only after every check and state write
+        // above has succeeded, so a failure in proposal creation can never
+        // leave the proposer's tokens locked without a matching proposal.
+        gov_token.transfer(&proposer, &env.current_contract_address(), &deposit);
 
         env.events().publish(
             (Symbol::new(&env, "proposal_created"),),
@@ -729,6 +749,7 @@ impl GovernanceDao {
         } else {
             own_weight
         };
+        let own_tally_weight = Self::time_weighted(&env, &voter, capped_own_weight);
 
         // 2. Lock tokens in the DAO contract to prevent token cycling / double-voting
         //
@@ -740,7 +761,7 @@ impl GovernanceDao {
         // 3. Add any weight delegated to this voter, recording each delegator
         //    so they cannot also vote this proposal themselves.
         let delegated_weight = Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
-        let weight = capped_own_weight.saturating_add(delegated_weight);
+        let weight = own_tally_weight.saturating_add(delegated_weight);
 
         // Save the tracked locked balance for later retrieval
         // Only the voter's own tokens were transferred in, so only that amount
@@ -868,6 +889,7 @@ impl GovernanceDao {
         } else {
             own_weight
         };
+        let own_tally_weight = Self::time_weighted(&env, &voter, capped_own_weight);
         gov_token.transfer(&voter, &env.current_contract_address(), &capped_own_weight);
 
         for i in 0..proposal_ids.len() {
@@ -876,7 +898,7 @@ impl GovernanceDao {
 
             let delegated_weight =
                 Self::collect_delegated_weight(&env, &voter, proposal_id, &gov_token);
-            let weight = capped_own_weight.saturating_add(delegated_weight);
+            let weight = own_tally_weight.saturating_add(delegated_weight);
 
             match choice {
                 VoteChoice::For => proposal.votes_for += weight,
@@ -1007,6 +1029,10 @@ impl GovernanceDao {
 
         let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
         let total_supply = proposal.total_supply;
+        
+        // SECURITY FIX: Only count For + Against votes toward quorum, not Abstain
+        // This prevents a proposal from passing with only abstain votes
+        let partisan_votes = proposal.votes_for + proposal.votes_against;
         let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
 
         // Adaptive quorum: after a run of low-turnout votes the requirement
@@ -1031,24 +1057,21 @@ impl GovernanceDao {
             .and_then(|v| v.checked_div(10_000))
             .unwrap_or(i128::MAX);
 
-        if total_votes == 0 {
-            // No participation at all — always fails, even for a legacy
-            // proposal that snapshotted total_supply == 0 (quorum_needed == 0).
+        if partisan_votes == 0 {
+            // No partisan votes (For or Against) — always fails, even with high abstain turnout.
+            // An all-Abstain proposal has no clear mandate.
             proposal.status = ProposalStatus::Failed;
-        } else if total_votes < quorum_needed {
+        } else if partisan_votes < quorum_needed {
             proposal.status = ProposalStatus::Failed;
         } else {
             // Majority is decided by the partisan (For/Against) split only —
-            // Abstain already did its job by counting toward quorum above and
-            // must not also dilute the For share here, otherwise a large
+            // Abstain already did its job by counting toward total participation for history
+            // and must not also dilute the For share here, otherwise a large
             // abstaining bloc could sink a proposal that every partisan voter
             // supported (issue #385).
-            let partisan_votes = proposal.votes_for + proposal.votes_against;
             let for_bps = if partisan_votes > 0 {
                 proposal.votes_for.checked_mul(10_000).map(|v| v / partisan_votes).unwrap_or(0)
             } else {
-                // Nobody voted For or Against — an all-Abstain proposal has no
-                // majority to speak of, regardless of quorum.
                 0
             };
             if for_bps >= config.majority_bps as i128 {
@@ -1060,8 +1083,7 @@ impl GovernanceDao {
         }
 
         // Record this vote's turnout so it feeds the next proposal's adaptive
-        // quorum. Recorded for every finalized proposal, pass or fail, so the
-        // history reflects actual participation rather than only successes.
+        // quorum. Use total_votes (including abstain) to represent actual participation.
         Self::record_participation(&env, total_votes, total_supply);
 
         let gov_token = token::Client::new(&env, &config.gov_token);
@@ -1084,6 +1106,109 @@ impl GovernanceDao {
                 status: proposal.status.clone(),
             },
         );
+    }
+
+    /// Finalize multiple proposals atomically in a single transaction.
+    ///
+    /// When multiple proposals end at the same ledger, calling `finalize`
+    /// individually can yield inconsistent state because each call sees a
+    /// slightly different view. This batch variant processes all proposals
+    /// in one shot: each is validated and settled sequentially, but the
+    /// entire batch either succeeds or reverts as a unit.
+    ///
+    /// Panics if any single proposal in the batch fails its finalization
+    /// checks (e.g. not Active, finalize delay not met), reverting the
+    /// whole batch. Permissionless — same rules as `finalize`.
+    pub fn finalize_batch(env: Env, proposal_ids: Vec<u64>) {
+        if proposal_ids.is_empty() {
+            panic_with_error!(&env, Error::NoProposals);
+        }
+
+        // Cap batch size to bound instruction budget.
+        const MAX_BATCH_FINALIZE: u32 = 20;
+        if proposal_ids.len() > MAX_BATCH_FINALIZE {
+            panic_with_error!(&env, Error::BatchTooLarge);
+        }
+
+        let config: DaoConfig = env.storage().instance().get(&StorageKey::Config).unwrap();
+        let gov_token = token::Client::new(&env, &config.gov_token);
+
+        for i in 0..proposal_ids.len() {
+            let pid = proposal_ids.get_unchecked(i);
+            let mut proposal: Proposal = env
+                .storage()
+                .persistent()
+                .get(&StorageKey::Proposal(pid))
+                .unwrap_or_else(|| panic_with_error!(&env, Error::ProposalNotFound));
+
+            if proposal.status != ProposalStatus::Active {
+                panic_with_error!(&env, Error::ProposalNotActive);
+            }
+
+            if env.ledger().timestamp() <= proposal.vote_end + FINALIZE_DELAY {
+                panic_with_error!(&env, Error::FinalizeDelayNotMet);
+            }
+
+            let total_supply = proposal.total_supply;
+            let partisan_votes = proposal.votes_for + proposal.votes_against;
+
+            let effective = Self::effective_quorum(&env, &config);
+            if effective.decayed {
+                env.events().publish(
+                    (Symbol::new(&env, "quorum_decay_applied"),),
+                    QuorumDecayApplied {
+                        proposal_id: pid,
+                        base_bps: effective.base_bps,
+                        effective_bps: effective.quorum_bps,
+                        avg_participation_bps: effective.avg_participation_bps,
+                    },
+                );
+            }
+
+            let quorum_needed = total_supply
+                .checked_mul(effective.quorum_bps as i128)
+                .and_then(|v| v.checked_div(10_000))
+                .unwrap_or(i128::MAX);
+
+            if partisan_votes == 0 {
+                proposal.status = ProposalStatus::Failed;
+            } else if partisan_votes < quorum_needed {
+                proposal.status = ProposalStatus::Failed;
+            } else {
+                let for_bps = if partisan_votes > 0 {
+                    proposal.votes_for.checked_mul(10_000).map(|v| v / partisan_votes).unwrap_or(0)
+                } else {
+                    0
+                };
+                if for_bps >= config.majority_bps as i128 {
+                    proposal.status = ProposalStatus::Passed;
+                    proposal.execution_time = env.ledger().timestamp() + config.proposal_timelock;
+                } else {
+                    proposal.status = ProposalStatus::Failed;
+                }
+            }
+
+            let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
+            Self::record_participation(&env, total_votes, total_supply);
+
+            gov_token.transfer(
+                &env.current_contract_address(),
+                &proposal.proposer,
+                &proposal.deposit,
+            );
+
+            env.storage()
+                .persistent()
+                .set(&StorageKey::Proposal(pid), &proposal);
+
+            env.events().publish(
+                (Symbol::new(&env, "proposal_finalized"),),
+                ProposalFinalized {
+                    proposal_id: pid,
+                    status: proposal.status.clone(),
+                },
+            );
+        }
     }
 
     /// Reclaim a proposer's deposit on a proposal that was never finalized.
@@ -1474,6 +1599,54 @@ impl GovernanceDao {
         );
     }
 
+    /// Enable or tune time-weighted voting power (issue #515). Admin-only.
+    ///
+    /// `ramp_period` is the seconds of holding needed for full weight and
+    /// `min_bps` the share of a balance that counts from the start.
+    pub fn set_time_weight(env: Env, admin: Address, enabled: bool, ramp_period: u64, min_bps: u32) {
+        Self::require_admin(&env, &admin);
+        if enabled && (ramp_period == 0 || min_bps > FULL_WEIGHT_BPS) {
+            panic_with_error!(&env, Error::InvalidTimeWeight);
+        }
+        env.storage().instance().set(
+            &StorageKey::TimeWeight,
+            &TimeWeightConfig { enabled, ramp_period, min_bps },
+        );
+        env.events().publish(
+            (Symbol::new(&env, "time_weight_updated"),),
+            TimeWeightConfigUpdated { enabled, ramp_period, min_bps },
+        );
+    }
+
+    /// The current time-weighted voting settings.
+    pub fn get_time_weight(env: Env) -> TimeWeightConfig {
+        Self::time_weight_config(&env)
+    }
+
+    /// Record the caller's current balance as held from now, starting (or
+    /// continuing) the ramp toward full voting weight.
+    ///
+    /// A balance at or below the recorded amount keeps its original start
+    /// time and lowers the recorded amount. A larger balance restarts the
+    /// clock, so tokens bought just before a vote cannot borrow the age of
+    /// tokens held earlier.
+    pub fn checkpoint_voting_power(env: Env, holder: Address) {
+        holder.require_auth();
+        let config: DaoConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        let balance = token::Client::new(&env, &config.gov_token).balance(&holder);
+        let key = StorageKey::WeightCheckpoint(holder);
+        let now = env.ledger().timestamp();
+        let cp = match env.storage().persistent().get::<_, WeightCheckpoint>(&key) {
+            Some(prev) if balance <= prev.amount => WeightCheckpoint { amount: balance, since: prev.since },
+            _ => WeightCheckpoint { amount: balance, since: now },
+        };
+        env.storage().persistent().set(&key, &cp);
+    }
+
     /// The current adaptive-quorum settings.
     pub fn get_quorum_decay(env: Env) -> QuorumDecayConfig {
         Self::quorum_decay_config(&env)
@@ -1787,6 +1960,36 @@ impl GovernanceDao {
         );
     }
 
+    /// Admin-only: change the minimum governance-token balance needed to create
+    /// a proposal, without replacing the rest of the DAO configuration
+    /// (issue #551). Like `update_config`, it only affects proposals created
+    /// after this call; in-flight proposals keep the deposit snapshotted at
+    /// creation. The threshold must be positive.
+    pub fn set_proposal_threshold(env: Env, admin: Address, new_threshold: i128) {
+        Self::require_admin(&env, &admin);
+        if new_threshold <= 0 {
+            panic_with_error!(&env, Error::InvalidInput);
+        }
+        let mut config: DaoConfig = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        config.proposal_threshold = new_threshold;
+        env.storage().instance().set(&StorageKey::Config, &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "dao_config_updated"),),
+            DaoConfigUpdated {
+                gov_token: config.gov_token.clone(),
+                proposal_threshold: config.proposal_threshold,
+                total_supply: config.total_supply,
+                voting_period: config.voting_period,
+                proposal_timelock: config.proposal_timelock,
+            },
+        );
+    }
+
     /// Upgrade the contract WASM in-place. Only the admin may call this.
     /// Storage is preserved across upgrades; only the execution code changes.
     /// Runs storage migrations if the new version requires them.
@@ -1833,12 +2036,18 @@ impl GovernanceDao {
 
     /// Configure the guardian set and approval threshold required for
     /// critical actions (currently: contract upgrades). Admin-only.
-    /// `threshold == 0` disables the guardian requirement (default), so the
-    /// admin alone can act — preserves existing single-admin behavior until
-    /// guardians are explicitly configured.
+    /// `threshold` must be at least 1 and at most `guardians.len()`. Setting
+    /// threshold to 0 is rejected to prevent disabling multisig security (issue #523).
     pub fn set_guardians(env: Env, admin: Address, guardians: Vec<Address>, threshold: u32) {
         Self::require_admin(&env, &admin);
-        if threshold > guardians.len() {
+        for i in 0..guardians.len() {
+            for j in (i + 1)..guardians.len() {
+                if guardians.get(i).unwrap() == guardians.get(j).unwrap() {
+                    panic_with_error!(&env, Error::InvalidInput);
+                }
+            }
+        }
+        if threshold == 0 || threshold > guardians.len() {
             panic_with_error!(&env, Error::InvalidThreshold);
         }
         env.storage().instance().set(&StorageKey::Guardians, &guardians);
@@ -1991,6 +2200,10 @@ impl GovernanceDao {
             panic_with_error!(&env, Error::AlreadyExecuted);
         }
 
+        if proposal.is_vetoed {
+            panic_with_error!(&env, Error::ProposalVetoed);
+        }
+
         proposal.is_vetoed = true;
         env.storage()
             .persistent()
@@ -2078,6 +2291,38 @@ impl GovernanceDao {
             .proposal_threshold
             .saturating_mul(mult_bps)
             .saturating_div(MIN_MULTIPLIER_BPS as i128)
+    }
+
+    fn time_weight_config(env: &Env) -> TimeWeightConfig {
+        env.storage()
+            .instance()
+            .get(&StorageKey::TimeWeight)
+            .unwrap_or(TimeWeightConfig { enabled: false, ramp_period: 0, min_bps: FULL_WEIGHT_BPS })
+    }
+
+    /// Voting weight for `balance` held by `holder`. Identity when time
+    /// weighting is off. Otherwise the checkpointed part of the balance ramps
+    /// from `min_bps` to full over `ramp_period`, and anything above the
+    /// checkpoint counts at `min_bps`.
+    fn time_weighted(env: &Env, holder: &Address, balance: i128) -> i128 {
+        let cfg = Self::time_weight_config(env);
+        if !cfg.enabled || balance <= 0 {
+            return balance;
+        }
+        let full = FULL_WEIGHT_BPS as i128;
+        let min = cfg.min_bps as i128;
+        let now = env.ledger().timestamp();
+        let (aged, since) = match env
+            .storage()
+            .persistent()
+            .get::<_, WeightCheckpoint>(&StorageKey::WeightCheckpoint(holder.clone()))
+        {
+            Some(cp) => (core::cmp::min(cp.amount, balance), cp.since),
+            None => (0, now),
+        };
+        let elapsed = core::cmp::min(now.saturating_sub(since), cfg.ramp_period) as i128;
+        let factor = min + (full - min) * elapsed / cfg.ramp_period as i128;
+        aged.saturating_mul(factor) / full + (balance - aged).saturating_mul(min) / full
     }
 
     /// Adaptive-quorum settings, or the disabled default.
@@ -2267,7 +2512,8 @@ impl GovernanceDao {
             }
             env.storage().persistent().set(&marker, &true);
 
-            total = total.saturating_add(balance);
+            let counted = Self::time_weighted(env, &delegator, balance);
+            total = total.saturating_add(counted);
 
             // Track delegation usage for off-chain indexing
             env.events().publish(
@@ -2276,7 +2522,7 @@ impl GovernanceDao {
                     proposal_id,
                     delegate: voter.clone(),
                     delegator,
-                    weight: balance,
+                    weight: counted,
                 },
             );
         }
