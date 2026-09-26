@@ -24,6 +24,11 @@ struct World {
     policy_id: Address,
     claims_id: Address,
     pool_id:   Address,
+    /// Third-party LP that funds the pool. The risk pool refuses to let its
+    /// admin take an LP position (issue #568), so the pool's capital has to
+    /// come from somewhere else — and tests that want a solvent pool have to
+    /// say who is providing it.
+    lp:        Address,
 }
 
 fn deploy() -> World {
@@ -34,6 +39,7 @@ fn deploy() -> World {
     let admin  = Address::generate(&env);
     let keeper = Address::generate(&env);
     let oracle_wallet = Address::generate(&env);
+    let lp = Address::generate(&env);
 
     let usdc = env.register_stellar_asset_contract_v2(admin.clone()).address();
 
@@ -80,7 +86,7 @@ fn deploy() -> World {
     PolicyEngineClient::new(&env, &policy_id)
         .set_claims_processor(&admin, &claims_id);
 
-    World { env, admin, keeper, oracle_w: oracle_wallet, usdc, oracle_id, policy_id, claims_id, pool_id }
+    World { env, admin, keeper, oracle_w: oracle_wallet, usdc, oracle_id, policy_id, claims_id, pool_id, lp }
 }
 
 fn create_crop_product(w: &World) -> u128 {
@@ -104,9 +110,11 @@ fn create_crop_product(w: &World) -> u128 {
 
 fn buy_crop_policy(w: &World, buyer: &Address, product_id: u128) -> u128 {
     StellarAssetClient::new(&w.env, &w.usdc).mint(buyer, &5_000_000_000i128);
-    // Fund the pool and policy contract with coverage capital
-    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.admin, &1_000_000_000i128);
-    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&w.admin, &1_000_000_000i128, &0i128, &false);
+    // Fund the pool with coverage capital. The LP must not be the admin:
+    // RiskPool rejects an admin deposit (issue #568), because the admin also
+    // sets the pool's risk parameters and can authorise emergency exits.
+    StellarAssetClient::new(&w.env, &w.usdc).mint(&w.lp, &1_000_000_000i128);
+    RiskPoolClient::new(&w.env, &w.pool_id).deposit(&w.lp, &1_000_000_000i128, &0i128, &false);
     StellarAssetClient::new(&w.env, &w.usdc).mint(&w.policy_id, &10_000_000_000i128);
     
     let policy_id = PolicyEngineClient::new(&w.env, &w.policy_id)

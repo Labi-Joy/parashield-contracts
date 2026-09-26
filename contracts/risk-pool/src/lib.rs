@@ -217,6 +217,11 @@ pub enum Error {
     InvalidAmount             = 42,
     /// A provider already holds an LP NFT, so a second one must not be minted.
     ProviderAlreadyHasNft     = 43,
+    /// The contract admin tried to become an LP, either by depositing or by
+    /// being the receiving side of a position transfer. The admin sets the
+    /// pool's risk parameters and can authorise emergency withdrawals, so it
+    /// must not also be exposed to them (issue #568).
+    AdminCannotBeLp           = 44,
 }
 
 #[contract]
@@ -330,6 +335,15 @@ impl RiskPool {
     /// `min_shares` is a slippage guard — the transaction reverts if fewer shares would be issued.
     /// `compound_enabled` — if true, accrued yield is automatically reinvested (compounded)
     /// instead of being paid out on each deposit. LPs can toggle this later via `toggle_compound`.
+    ///
+    /// The admin cannot be an LP (issue #568). LP principal is the pool's
+    /// solvency backstop, and the admin also sets capacity, fees, tier
+    /// discounts, exit delay and the emergency withdrawal that pays an LP
+    /// out. An admin who is also an LP is short the pool with one hand and
+    /// entitled to withdraw from it with the other, and a bad fee or
+    /// capacity change lands on their own deposit. The separation costs
+    /// nothing here — the pool already requires third-party liquidity to
+    /// function — so the conflict is refused outright rather than bounded.
     pub fn deposit(
         env: Env,
         provider: Address,
@@ -342,6 +356,7 @@ impl RiskPool {
         Self::validate_stellar_address(&env, &provider);
         
         provider.require_auth();
+        Self::require_not_admin(&env, &provider);
         if amount <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if amount < MIN_DEPOSIT { panic_with_error!(&env, Error::DepositTooSmall); }
         if amount % MIN_DEPOSIT != 0 { panic_with_error!(&env, Error::InvalidAmount); }
@@ -657,10 +672,15 @@ impl RiskPool {
 
     /// Transfer `shares` from `from` address to `to` address.
     /// Returns the proportional USDC deposit amount transferred.
+    ///
+    /// The admin cannot be the receiving side either (issue #568) —
+    /// otherwise `transfer_position` is a one-transaction way around the
+    /// `deposit` restriction and the separation of duties it exists for.
     pub fn transfer_position(env: Env, from: Address, to: Address, shares: i128) -> i128 {
         from.require_auth();
         if shares <= 0 { panic_with_error!(&env, Error::ZeroAmount); }
         if from == to { panic_with_error!(&env, Error::InvalidAddress); }
+        Self::require_not_admin(&env, &to);
         Self::assert_active(&env);
 
         let from_key = StorageKey::LpPosition(from.clone());
@@ -2465,6 +2485,19 @@ impl RiskPool {
             .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
         if *caller != admin { panic_with_error!(env, Error::Unauthorized); }
         caller.require_auth();
+    }
+
+    /// Panic with `AdminCannotBeLp` if `caller` is the contract admin.
+    ///
+    /// Separation of duties for the LP side of the pool (issue #568). Kept
+    /// deliberately distinct from `Unauthorized` so an integrator can tell
+    /// "this address is barred from being an LP" from "this address is not
+    /// allowed to do that".
+    fn require_not_admin(env: &Env, caller: &Address) {
+        let admin: Option<Address> = env.storage().instance().get(&StorageKey::Admin);
+        if admin.as_ref() == Some(caller) {
+            panic_with_error!(env, Error::AdminCannotBeLp);
+        }
     }
 
     /// Validate that an address has a valid Stellar format (56-char, starts with G or C).
