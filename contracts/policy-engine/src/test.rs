@@ -1820,3 +1820,105 @@ fn test_non_admin_cannot_resume() {
     let stranger = Address::generate(&env);
     client.emergency_resume(&stranger);
 }
+
+// ── Coverage range must be a real range (issue #567) ───────────────────────────
+
+/// A product is only meaningful if a policyholder can actually buy
+/// something: `buy_policy` rejects any coverage below `coverage_min` or
+/// above `coverage_max` (line ~631). A product published with
+/// `coverage_min > coverage_max` therefore has an empty buyable set — the
+/// product exists, is listed as active, and can never be sold, which is
+/// indistinguishable from a broken product to an integrator.
+///
+/// `coverage_min == coverage_max` is the same defect by another route: a
+/// single reachable coverage amount, and only if the arithmetic lands
+/// exactly. `coverage_min <= 0` is worse still — free cover.
+fn params_with_coverage(min: i128, max: i128) -> CreateProductParams {
+    CreateProductParams {
+        name: symbol_short!("cov_rng"),
+        category: symbol_short!("crop"),
+        oracle_key: symbol_short!("kis2606"),
+        trigger_type: TriggerType::Threshold,
+        oracle_data_type: symbol_short!("weather"),
+        trigger_threshold: 50_000_000,
+        trigger_comparison: TriggerComparison::LessThan,
+        coverage_min: min,
+        coverage_max: max,
+        premium_rate_bps: 500,
+        max_duration_days: 365,
+    }
+}
+
+/// The reported case: min strictly above max.
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn create_product_rejects_inverted_coverage_range() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    PolicyEngineClient::new(&env, &contract_id)
+        .create_product(&admin, &params_with_coverage(10_000_000_000, 100_000_000));
+}
+
+/// One unit of separation is still a range; only equality is rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn create_product_rejects_zero_width_coverage_range() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    PolicyEngineClient::new(&env, &contract_id)
+        .create_product(&admin, &params_with_coverage(1_000_000_000, 1_000_000_000));
+}
+
+/// Free cover, and inverted-by-sign nonsense, are the same invariant.
+#[test]
+fn create_product_rejects_zero_or_negative_coverage_min() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+    assert!(client
+        .try_create_product(&admin, &params_with_coverage(0, 10_000_000_000))
+        .is_err());
+    assert!(client
+        .try_create_product(&admin, &params_with_coverage(-1, 10_000_000_000))
+        .is_err());
+}
+
+/// A non-positive `coverage_max` cannot satisfy `0 < min < max` either, so
+/// it is rejected by the same check without needing its own branch.
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn create_product_rejects_non_positive_coverage_max() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    PolicyEngineClient::new(&env, &contract_id)
+        .create_product(&admin, &params_with_coverage(100_000_000, 0));
+}
+
+/// The boundary must not be over-tight: adjacent bounds, and the smallest
+/// legal range, are both real products and must be accepted.
+#[test]
+fn create_product_accepts_narrow_but_valid_coverage_ranges() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+
+    let id = client.create_product(&admin, &params_with_coverage(1, 2));
+    let product = client.get_product(&id);
+    assert_eq!(product.coverage_min, 1);
+    assert_eq!(product.coverage_max, 2);
+
+    let mut wide = params_with_coverage(999_999, 1_000_000);
+    wide.name = symbol_short!("cov_rng2");
+    wide.oracle_key = symbol_short!("kis2607");
+    let id = client.create_product(&admin, &wide);
+    assert_eq!(client.get_product(&id).coverage_min, 999_999);
+}
+
+/// A rejected product must leave nothing behind — no active product, and
+/// no product id consumed — so a later valid create still gets id 1.
+#[test]
+fn rejected_coverage_range_writes_nothing() {
+    let (env, admin, _oracle, _usdc, contract_id) = setup();
+    let client = PolicyEngineClient::new(&env, &contract_id);
+
+    assert!(client
+        .try_create_product(&admin, &params_with_coverage(10_000_000_000, 1_000_000_000))
+        .is_err());
+    assert_eq!(client.get_active_products().len(), 0);
+    assert_eq!(client.create_product(&admin, &params_with_coverage(1_000, 2_000)), 1);
+}
