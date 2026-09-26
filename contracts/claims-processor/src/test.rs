@@ -1497,7 +1497,7 @@ fn test_matching_claimant_still_settles() {
 /// claimant, not to the policy, so an admin-owned policy is simply not
 /// claimable by its owner.
 #[test]
-#[should_panic(expected = "Error(Contract, #28)")]
+#[should_panic(expected = "Error(Contract, #29)")]
 fn test_admin_cannot_file_claim_on_own_policy() {
     let w      = deploy();
     let pid    = create_crop_product(&w);
@@ -1511,7 +1511,7 @@ fn test_admin_cannot_file_claim_on_own_policy() {
 /// The batch entry point must not be a way around the single-claim guard —
 /// it routes through `submit_claim`, and this pins that.
 #[test]
-#[should_panic(expected = "Error(Contract, #28)")]
+#[should_panic(expected = "Error(Contract, #29)")]
 fn test_admin_cannot_file_claim_through_batch() {
     let w      = deploy();
     let pid    = create_crop_product(&w);

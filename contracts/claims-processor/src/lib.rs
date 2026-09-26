@@ -130,6 +130,8 @@ enum StorageKey {
     AutoProcessLastTime(u128),
     /// SECURITY FIX: Minimum cooldown in seconds between auto_process calls for the same policy.
     AutoProcessCooldown,
+    /// Authorized identity attesters list (Vec<Address>).
+    AuthorizedAttesters,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -175,13 +177,15 @@ pub enum Error {
     RateLimitExceeded = 25,
     /// A payout larger than the policy's coverage amount was attempted (issue #550).
     PayoutExceedsCoverage = 26,
+    /// The caller is not in the authorized attesters list.
+    UnauthorizedAttester = 27,
     /// A claim was filed outside the policy's coverage period — before
     /// `start_time` or after `end_time`.
-    ClaimOutsideCoveragePeriod = 27,
+    ClaimOutsideCoveragePeriod = 28,
     /// The contract admin tried to file a claim, on any policy. The admin
     /// resolves disputes and controls payout configuration; letting them
     /// also be the claimant is self-dealing (issue #566).
-    AdminCannotBeClaimant = 28,
+    AdminCannotBeClaimant = 29,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -347,12 +351,13 @@ impl ClaimsProcessor {
 
     /// The claim-filing body shared by `submit_claim` and
     /// `batch_submit_claims`. The caller has already authorized `claimant`,
-    /// checked the pause flag and rejected the admin — deliberately *not*
-    /// re-done here, because a second `require_auth` for the same address in
-    /// the same call frame is rejected by the host (`Auth, ExistingValue`).
-    /// `batch_submit_claims` delegating to `submit_claim` therefore made the
-    /// whole batch path unreachable for every caller; the shared body keeps
-    /// one set of rules instead of two copies of them.
+    /// checked the pause flag and rejected the admin — deliberately
+    /// *not* re-done here, because a second `require_auth` for the same
+    /// address in the same call frame is rejected by the host
+    /// (`Auth, ExistingValue`). `batch_submit_claims` delegating to
+    /// `submit_claim` therefore made the whole batch path unreachable for
+    /// every caller; the shared body keeps one set of rules instead of two
+    /// copies of them.
     fn file_claim(env: &Env, claimant: &Address, policy_id: u128) -> u128 {
         // Guard: one claim per policy
         if env.storage().persistent().has(&StorageKey::PolicyClaim(policy_id)) {
@@ -1785,15 +1790,75 @@ impl ClaimsProcessor {
         );
     }
 
-    /// Admin-only: manually verify a claimant's identity for a claim.
-    /// Used when off-chain identity verification is completed or approved by DAO.
+    /// Admin-only: add an address to the authorized attesters list.
+    pub fn add_authorized_attester(env: Env, admin: Address, attester: Address) {
+        Self::require_admin(&env, &admin);
+        let mut attesters: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::AuthorizedAttesters)
+            .unwrap_or_else(|| Vec::new(&env));
+        for i in 0..attesters.len() {
+            if attesters.get_unchecked(i) == attester {
+                return;
+            }
+        }
+        attesters.push_back(attester.clone());
+        env.storage()
+            .instance()
+            .set(&StorageKey::AuthorizedAttesters, &attesters);
+        env.events().publish(
+            (Symbol::new(&env, "attester_added"),),
+            attester,
+        );
+    }
+
+    /// Admin-only: remove an address from the authorized attesters list.
+    pub fn remove_authorized_attester(env: Env, admin: Address, attester: Address) {
+        Self::require_admin(&env, &admin);
+        let mut attesters: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::AuthorizedAttesters)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut idx: Option<u32> = None;
+        for i in 0..attesters.len() {
+            if attesters.get_unchecked(i) == attester {
+                idx = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = idx {
+            attesters.remove(i);
+            env.storage()
+                .instance()
+                .set(&StorageKey::AuthorizedAttesters, &attesters);
+        }
+        env.events().publish(
+            (Symbol::new(&env, "attester_removed"),),
+            attester,
+        );
+    }
+
+    /// Return the list of authorized attesters.
+    pub fn get_authorized_attesters(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::AuthorizedAttesters)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Verify a claimant's identity for a claim. Callable by admin or any
+    /// authorized attester. The caller must be either the contract admin or
+    /// an address previously added via `add_authorized_attester`.
     pub fn verify_claimant_identity(
         env: Env,
-        admin: Address,
+        attester: Address,
         claim_id: u128,
         id_type: Symbol,
     ) {
-        Self::require_admin(&env, &admin);
+        attester.require_auth();
+        Self::require_admin_or_attester(&env, &attester);
 
         let mut claim: Claim = env
             .storage()
@@ -2033,6 +2098,27 @@ impl ClaimsProcessor {
             panic_with_error!(env, Error::Unauthorized);
         }
         caller.require_auth();
+    }
+
+    /// Panic unless `caller` is the admin or an authorized attester.
+    fn require_admin_or_attester(env: &Env, caller: &Address) {
+        let admin: Address = env.storage().instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        if *caller == admin {
+            return;
+        }
+        let attesters: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::AuthorizedAttesters)
+            .unwrap_or_else(|| Vec::new(env));
+        for i in 0..attesters.len() {
+            if attesters.get_unchecked(i) == *caller {
+                return;
+            }
+        }
+        panic_with_error!(env, Error::UnauthorizedAttester);
     }
 
     /// Panic if the contract is currently paused.
