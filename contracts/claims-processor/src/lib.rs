@@ -130,6 +130,8 @@ enum StorageKey {
     AutoProcessLastTime(u128),
     /// SECURITY FIX: Minimum cooldown in seconds between auto_process calls for the same policy.
     AutoProcessCooldown,
+    /// Authorized identity attesters list (Vec<Address>).
+    AuthorizedAttesters,
 }
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
@@ -175,6 +177,8 @@ pub enum Error {
     RateLimitExceeded = 25,
     /// A payout larger than the policy's coverage amount was attempted (issue #550).
     PayoutExceedsCoverage = 26,
+    /// The caller is not in the authorized attesters list.
+    UnauthorizedAttester = 27,
 }
 
 /// Approximate Stellar ledger close time in seconds, used to convert
@@ -1752,15 +1756,75 @@ impl ClaimsProcessor {
         );
     }
 
-    /// Admin-only: manually verify a claimant's identity for a claim.
-    /// Used when off-chain identity verification is completed or approved by DAO.
+    /// Admin-only: add an address to the authorized attesters list.
+    pub fn add_authorized_attester(env: Env, admin: Address, attester: Address) {
+        Self::require_admin(&env, &admin);
+        let mut attesters: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::AuthorizedAttesters)
+            .unwrap_or_else(|| Vec::new(&env));
+        for i in 0..attesters.len() {
+            if attesters.get_unchecked(i) == attester {
+                return;
+            }
+        }
+        attesters.push_back(attester.clone());
+        env.storage()
+            .instance()
+            .set(&StorageKey::AuthorizedAttesters, &attesters);
+        env.events().publish(
+            (Symbol::new(&env, "attester_added"),),
+            attester,
+        );
+    }
+
+    /// Admin-only: remove an address from the authorized attesters list.
+    pub fn remove_authorized_attester(env: Env, admin: Address, attester: Address) {
+        Self::require_admin(&env, &admin);
+        let mut attesters: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::AuthorizedAttesters)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut idx: Option<u32> = None;
+        for i in 0..attesters.len() {
+            if attesters.get_unchecked(i) == attester {
+                idx = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = idx {
+            attesters.remove(i);
+            env.storage()
+                .instance()
+                .set(&StorageKey::AuthorizedAttesters, &attesters);
+        }
+        env.events().publish(
+            (Symbol::new(&env, "attester_removed"),),
+            attester,
+        );
+    }
+
+    /// Return the list of authorized attesters.
+    pub fn get_authorized_attesters(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::AuthorizedAttesters)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Verify a claimant's identity for a claim. Callable by admin or any
+    /// authorized attester. The caller must be either the contract admin or
+    /// an address previously added via `add_authorized_attester`.
     pub fn verify_claimant_identity(
         env: Env,
-        admin: Address,
+        attester: Address,
         claim_id: u128,
         id_type: Symbol,
     ) {
-        Self::require_admin(&env, &admin);
+        attester.require_auth();
+        Self::require_admin_or_attester(&env, &attester);
 
         let mut claim: Claim = env
             .storage()
@@ -2000,6 +2064,27 @@ impl ClaimsProcessor {
             panic_with_error!(env, Error::Unauthorized);
         }
         caller.require_auth();
+    }
+
+    /// Panic unless `caller` is the admin or an authorized attester.
+    fn require_admin_or_attester(env: &Env, caller: &Address) {
+        let admin: Address = env.storage().instance()
+            .get(&StorageKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+        if *caller == admin {
+            return;
+        }
+        let attesters: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&StorageKey::AuthorizedAttesters)
+            .unwrap_or_else(|| Vec::new(env));
+        for i in 0..attesters.len() {
+            if attesters.get_unchecked(i) == *caller {
+                return;
+            }
+        }
+        panic_with_error!(env, Error::UnauthorizedAttester);
     }
 
     /// Panic if the contract is currently paused.
